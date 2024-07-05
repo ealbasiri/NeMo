@@ -1,5 +1,5 @@
-NeMo TTS Collection API
-=======================
+NeMo TTS API
+============
 
 Model Classes
 -------------
@@ -65,6 +65,14 @@ Vocoders
     :exclude-members: setup_training_data, setup_validation_data, training_step, on_validation_epoch_end, validation_step, setup_test_data, on_train_epoch_start
 
 .. autoclass:: nemo.collections.tts.models.WaveGlowModel
+    :show-inheritance:
+    :members:
+    :exclude-members: setup_training_data, setup_validation_data, training_step, on_validation_epoch_end, validation_step, setup_test_data, on_train_epoch_start
+
+
+Codecs
+~~~~~~
+.. autoclass:: nemo.collections.tts.models.AudioCodecModel
     :show-inheritance:
     :members:
     :exclude-members: setup_training_data, setup_validation_data, training_step, on_validation_epoch_end, validation_step, setup_test_data, on_train_epoch_start

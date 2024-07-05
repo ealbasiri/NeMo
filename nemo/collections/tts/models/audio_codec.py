@@ -118,7 +118,10 @@ class AudioCodecModel(ModelPT):
         # STFT loss setup
         stft_loss_log_guard = cfg.get("stft_loss_log_guard", 1.0)
         self.stft_loss_scale = cfg.get("stft_loss_scale", 0.0)
-        self.stft_loss_fn = MultiResolutionSTFTLoss(resolutions=loss_resolutions, log_guard=stft_loss_log_guard,)
+        self.stft_loss_fn = MultiResolutionSTFTLoss(
+            resolutions=loss_resolutions,
+            log_guard=stft_loss_log_guard,
+        )
 
         # Time domain loss setup
         self.time_domain_loss_scale = cfg.get("time_domain_loss_scale", 1.0)
@@ -192,8 +195,7 @@ class AudioCodecModel(ModelPT):
         },
     )
     def decode_audio(self, inputs: torch.Tensor, input_len: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Apply decoder on the input encoded representation. Note that the input is a
-        non-quantized or dequantized representation.
+        """Apply decoder on the input. Note that the input is a non-quantized encoder output or a dequantized representation.
 
         Args:
             inputs: encoded signal
@@ -238,10 +240,12 @@ class AudioCodecModel(ModelPT):
             "tokens": NeuralType(('B', 'C', 'T_encoded'), TokenIndex()),
             "tokens_len": NeuralType(tuple('B'), LengthsType()),
         },
-        output_types={"dequantized": NeuralType(('B', 'D', 'T_encoded'), EncodedRepresentation()),},
+        output_types={
+            "dequantized": NeuralType(('B', 'D', 'T_encoded'), EncodedRepresentation()),
+        },
     )
     def dequantize(self, tokens: torch.Tensor, tokens_len: torch.Tensor) -> torch.Tensor:
-        """Convert the discrete input tokens into a continuous encoded representation.
+        """Convert the discrete tokens into a continuous encoded representation.
 
         Args:
             tokens: discrete tokens for each codebook for each time frame
@@ -272,12 +276,12 @@ class AudioCodecModel(ModelPT):
         """Convert input time-domain audio signal into a discrete representation (tokens).
 
         Args:
-            audio: input time-domain signal, shape (batch, number of samples)
-            audio_len: valid length for each example in the batch, shape (batch size,)
+            audio: input time-domain signal, shape `(batch, number of samples)`
+            audio_len: valid length for each example in the batch, shape `(batch size,)`
 
         Returns:
-            Tokens for each codebook for each frame, shape (batch, number of codebooks, number of frames),
-            and the corresponding valid lengths, shape (batch,)
+            Tokens for each codebook for each frame, shape `(batch, number of codebooks, number of frames)`,
+            and the corresponding valid lengths, shape `(batch,)`
         """
         # Apply encoder to obtain a continuous vector for each frame
         encoded, encoded_len = self.encode_audio(audio=audio, audio_len=audio_len)
@@ -296,11 +300,11 @@ class AudioCodecModel(ModelPT):
         },
     )
     def decode(self, tokens: torch.Tensor, tokens_len: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Convert discrete input tokens into a continuous time-domain signal.
+        """Convert discrete tokens into a continuous time-domain signal.
 
         Args:
-            tokens: discrete tokens for each codebook for each time frame, shape (batch, number of codebooks, number of frames)
-            tokens_len: valid lengths, shape (batch,)
+            tokens: discrete tokens for each codebook for each time frame, shape `(batch, number of codebooks, number of frames)`
+            tokens_len: valid lengths, shape `(batch,)`
 
         Returns:
             Decoded output `audio` in the time domain and its length in number of samples `audio_len`.
@@ -393,8 +397,7 @@ class AudioCodecModel(ModelPT):
 
     @property
     def disc_update_prob(self) -> float:
-        """Probability of updating the discriminator.
-        """
+        """Probability of updating the discriminator."""
         return self.disc_updates_per_period / self.disc_update_period
 
     def should_update_disc(self, batch_idx) -> bool:
@@ -644,4 +647,27 @@ class AudioCodecModel(ModelPT):
 
     @classmethod
     def list_available_models(cls) -> List[PretrainedModelInfo]:
-        return []
+        models = []
+
+        model = PretrainedModelInfo(
+            pretrained_model_name="audio_codec_16khz_small",
+            location="https://api.ngc.nvidia.com/v2/models/nvidia/nemo/audio_codec_16khz_small/versions/v1/files/audio_codec_16khz_small.nemo",
+            description="For details about this model please refer to the model card: https://catalog.ngc.nvidia.com/orgs/nvidia/teams/nemo/models/audio_codec_16khz_small",
+        )
+        models.append(model)
+
+        model = PretrainedModelInfo(
+            pretrained_model_name="mel_codec_22khz_medium",
+            location="https://api.ngc.nvidia.com/v2/models/nvidia/nemo/mel_codec_22khz_medium/versions/v1/files/mel_codec_22khz_medium.nemo",
+            description="For details about this model please refer to the model card: https://catalog.ngc.nvidia.com/orgs/nvidia/teams/nemo/models/mel_codec_22khz_medium",
+        )
+        models.append(model)
+
+        model = PretrainedModelInfo(
+            pretrained_model_name="mel_codec_44khz_medium",
+            location="https://api.ngc.nvidia.com/v2/models/nvidia/nemo/mel_codec_44khz_medium/versions/v1/files/mel_codec_44khz_medium.nemo",
+            description="For details about this model please refer to the model card: https://catalog.ngc.nvidia.com/orgs/nvidia/teams/nemo/models/mel_codec_44khz_medium",
+        )
+        models.append(model)
+
+        return models

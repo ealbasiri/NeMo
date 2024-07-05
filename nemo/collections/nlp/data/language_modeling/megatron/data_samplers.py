@@ -81,15 +81,17 @@ class BaseMegatronSampler:
         num_available_samples: int = self.total_samples - self.consumed_samples
         if self.global_batch_size is not None:
             if self.drop_last:
-                return num_available_samples // self.global_batch_size
+                num_global_batches = num_available_samples // self.global_batch_size
             else:
-                return (num_available_samples + self.global_batch_size - 1) // self.global_batch_size
+                num_global_batches = (num_available_samples + self.global_batch_size - 1) // self.global_batch_size
+            # return len of dataloader in terms of micro batches to avoid discrepancy between len of dataloader and
+            # num of batches fetched (as training step fetches in terms of micro batches)
+            return num_global_batches * (self.global_batch_size // self.micro_batch_times_data_parallel_size)
         else:
             return (num_available_samples - 1) // self.micro_batch_times_data_parallel_size + 1
 
     @abc.abstractmethod
-    def __iter__(self):
-        ...
+    def __iter__(self): ...
 
 
 class MegatronPretrainingSampler(BaseMegatronSampler):
@@ -104,7 +106,7 @@ class MegatronPretrainingSampler(BaseMegatronSampler):
         indices = range(self.consumed_samples, self.total_samples)
         if (not self.drop_last) and self.pad_samples_to_global_batch_size:
             pad_samples_num = -len(indices) % self.global_batch_size
-            pad_indices = range(-1, -pad_samples_num - 1, -1)
+            pad_indices = [None] * pad_samples_num
             indices = chain(indices, pad_indices)
 
         for idx in indices:
@@ -162,9 +164,12 @@ class MegatronPretrainingRandomSampler(BaseMegatronSampler):
         num_available_samples = active_total_samples - self.consumed_samples % active_total_samples
         if self.global_batch_size is not None:
             if self.drop_last:
-                return num_available_samples // self.global_batch_size
+                num_global_batches = num_available_samples // self.global_batch_size
             else:
-                return (num_available_samples + self.global_batch_size - 1) // self.global_batch_size
+                num_global_batches = (num_available_samples + self.global_batch_size - 1) // self.global_batch_size
+            # return len of dataloader in terms of micro batches to avoid discrepancy between len of dataloader and
+            # num of batches fetched (as training step fetches in terms of micro batches)
+            return num_global_batches * (self.global_batch_size // self.micro_batch_times_data_parallel_size)
         else:
             if self.drop_last:
                 return num_available_samples // self.micro_batch_times_data_parallel_size
