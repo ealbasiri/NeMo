@@ -133,9 +133,12 @@ RUN pip install flash-attn
 # install numba for latest containers
 RUN pip install numba>=0.57.1
 
+# Install specific version of transformers
+RUN pip install transformers==4.40.2
 # copy nemo source into a scratch image
 FROM scratch as nemo-src
 COPY . .
+
 
 # start building the final container
 FROM nemo-deps as nemo
