@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import pdb
 import copy
 import os
 from typing import Dict, List, Optional, Union
@@ -33,8 +33,9 @@ from nemo.collections.asr.parts.mixins import ASRBPEMixin
 from nemo.collections.asr.parts.submodules.ctc_decoding import CTCBPEDecoding, CTCBPEDecodingConfig
 from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTBPEDecoding, RNNTBPEDecodingConfig
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
-from nemo.core.classes.common import PretrainedModelInfo
+from nemo.core.classes.common import PretrainedModelInfo, typecheck
 from nemo.utils import logging, model_utils
+from nemo.core.neural_types import AudioSignal, LengthsType, NeuralType, SpectrogramType, EncodedRepresentation, LabelsType
 
 def lens_to_mask(lens, max_length):
     batch_size = lens.shape[0]
@@ -84,7 +85,6 @@ class EncDecHybridRNNTCTCBPEModelAST(EncDecHybridRNNTCTCModel, ASRBPEMixin):
         with open_dict(cfg):
             if self.tokenizer_type == "agg":
                 cfg.aux_ctc.decoder.vocabulary = ListConfig(vocabulary)
-                self.cfg.lang_labels = self.tokenizer.langs
             else:
                 cfg.aux_ctc.decoder.vocabulary = ListConfig(list(vocabulary.keys()))
 
@@ -101,7 +101,9 @@ class EncDecHybridRNNTCTCBPEModelAST(EncDecHybridRNNTCTCModel, ASRBPEMixin):
         self.insertion_method = self.cfg.get("embed_method")
         self.insertion_location = self.cfg.get("embed_loc")
         print(f"Insertion location: {self.insertion_location}")
-        
+        if self.tokenizer_type == "agg":
+            with open_dict(self.cfg):
+                self.cfg.lang_labels = self.tokenizer.langs        
         self.insertion_proj = None
         lang_embed_dim = self.cfg.get("lang_embed_dim", cfg.preprocessor["features"])
         if self.insertion_location == "encoder":
@@ -158,7 +160,10 @@ class EncDecHybridRNNTCTCBPEModelAST(EncDecHybridRNNTCTCModel, ASRBPEMixin):
         self.cur_decoder = "rnnt"
 
     def _setup_dataloader_from_config(self, config: Optional[Dict]):
-                
+
+        if self.tokenizer_type == "agg":
+            with open_dict(self.cfg):
+                self.cfg.lang_labels = self.tokenizer.langs
         audio_to_text_dataset.inject_dataloader_value_from_model_config(self.cfg, config, key='lang_labels')
 
         if config.get("use_lhotse"):
@@ -553,15 +558,30 @@ class EncDecHybridRNNTCTCBPEModelAST(EncDecHybridRNNTCTCModel, ASRBPEMixin):
         # Spec augment is not applied during evaluation/testing
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
-        
+
         lang_vect = self.lang_embedding(lang_id)
-        
+
         if self.insertion_location == "encoder":
             processed_signal, processed_signal_length = self._add_embedding(processed_signal, processed_signal_length, lang_vect)
 
         encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
         return encoded, encoded_len
-    
+    @property
+    def input_types(self) -> Optional[Dict[str, NeuralType]]:
+        if hasattr(self.preprocessor, '_sample_rate'):
+            input_signal_eltype = AudioSignal(freq=self.preprocessor._sample_rate)
+        else:
+            input_signal_eltype = AudioSignal()
+        return {
+            "input_signal": NeuralType(('B', 'T'), input_signal_eltype, optional=True),
+            "input_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
+            "processed_signal": NeuralType(('B', 'D', 'T'), SpectrogramType(), optional=True),
+            "processed_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
+#            "lang_id": NeuralType(tuple('B'), EncodedRepresentation(), optional=True),
+            'lang_id': NeuralType(tuple('B'), LabelsType(), optional=True),
+#            "lang_id": NeuralType(('B',), LabelsType()), 
+            "sample_id": NeuralType(tuple('B'), LengthsType(), optional=True)
+        }    
     def training_step(self, batch, batch_nb):
         # Reset access registry
         if AccessMixin.is_access_enabled():
@@ -571,12 +591,11 @@ class EncDecHybridRNNTCTCBPEModelAST(EncDecHybridRNNTCTCModel, ASRBPEMixin):
             AccessMixin.set_access_enabled(access_enabled=True)
 
         signal, signal_len, transcript, transcript_len, lang_id = batch
-
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
             encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, lang_id=lang_id)
         del signal
 
         # During training, loss must be computed, so decoder forward is necessary
@@ -693,7 +712,7 @@ class EncDecHybridRNNTCTCBPEModelAST(EncDecHybridRNNTCTCModel, ASRBPEMixin):
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
             encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, lang_id=lang_id)
         del signal
 
         best_hyp_text, all_hyp_text = self.decoding.rnnt_decoder_predictions_tensor(
@@ -713,7 +732,7 @@ class EncDecHybridRNNTCTCBPEModelAST(EncDecHybridRNNTCTCModel, ASRBPEMixin):
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
             encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, lang_id=lang_id)
         del signal
 
         tensorboard_logs = {}
