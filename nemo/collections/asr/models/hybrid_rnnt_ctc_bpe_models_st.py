@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import pdb
+
 import copy
 import os
 from typing import Dict, List, Optional, Union
@@ -35,12 +35,7 @@ from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTBPEDecoding,
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.core.classes.common import PretrainedModelInfo, typecheck
 from nemo.utils import logging, model_utils
-from nemo.core.neural_types import AudioSignal, LengthsType, NeuralType, SpectrogramType, EncodedRepresentation, LabelsType
-
-def lens_to_mask(lens, max_length):
-    batch_size = lens.shape[0]
-    mask = torch.arange(max_length).repeat(batch_size, 1).to(lens.device) < lens[:, None]
-    return mask
+from nemo.core.neural_types import AudioSignal, LengthsType, NeuralType, SpectrogramType, LabelsType
 
 class EncDecHybridRNNTCTCBPEModelAST(EncDecHybridRNNTCTCModel, ASRBPEMixin):
     """Base class for encoder decoder RNNT-based models with auxiliary CTC decoder/loss and subword tokenization."""
@@ -98,28 +93,21 @@ class EncDecHybridRNNTCTCBPEModelAST(EncDecHybridRNNTCTCModel, ASRBPEMixin):
 
         super().__init__(cfg=cfg, trainer=trainer)
         
-        self.insertion_method = self.cfg.get("embed_method")
-        self.insertion_location = self.cfg.get("embed_loc")
-        print(f"Insertion location: {self.insertion_location}")
+        if cfg.get("initialize_lang_embeddings", False):
+            self.initialize_embeddings()
+
+    def initialize_embeddings(self):
+        self.insertion_method = "concat"
+        self.insertion_location = "encoder"
+        print("embedding has been initalized")
         if self.tokenizer_type == "agg":
             with open_dict(self.cfg):
                 self.cfg.lang_labels = self.tokenizer.langs        
-        self.insertion_proj = None
-        lang_embed_dim = self.cfg.get("lang_embed_dim", cfg.preprocessor["features"])
-        if self.insertion_location == "encoder":
-            encoded_dim = self.cfg.preprocessor["features"]         
-            if self.insertion_method == "expand":
-                self.insertion_proj = torch.nn.Linear(lang_embed_dim + encoded_dim, encoded_dim)
-            else:
-                lang_embed_dim = encoded_dim
-        else:
-            raise NameError
-        
+        lang_embed_dim = self.cfg.get("lang_embed_dim", self.cfg.preprocessor["features"])     
         self.lang_embedding = torch.nn.Embedding(
-                num_embeddings=len(self.cfg.get("lang_labels")), 
-                embedding_dim=lang_embed_dim,
-            )
-
+            num_embeddings=len(self.cfg.get("lang_labels")), 
+            embedding_dim=lang_embed_dim,
+        )
 
         # Setup decoding object
         self.decoding = RNNTBPEDecoding(
@@ -321,13 +309,13 @@ class EncDecHybridRNNTCTCBPEModelAST(EncDecHybridRNNTCTCModel, ASRBPEMixin):
 
         new_joint_config['num_classes'] = len(vocabulary)
         del self.joint
-        self.joint = EncDecHybridRNNTCTCBPEModel.from_config_dict(new_joint_config)
+        self.joint = EncDecHybridRNNTCTCBPEModelAST.from_config_dict(new_joint_config)
 
         decoder_config = self.decoder.to_config_dict()
         new_decoder_config = copy.deepcopy(decoder_config)
         new_decoder_config.vocab_size = len(vocabulary)
         del self.decoder
-        self.decoder = EncDecHybridRNNTCTCBPEModel.from_config_dict(new_decoder_config)
+        self.decoder = EncDecHybridRNNTCTCBPEModelAST.from_config_dict(new_decoder_config)
 
         del self.loss
         self.loss = RNNTLoss(num_classes=self.joint.num_classes_with_blank - 1)
@@ -566,6 +554,7 @@ class EncDecHybridRNNTCTCBPEModelAST(EncDecHybridRNNTCTCModel, ASRBPEMixin):
 
         encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
         return encoded, encoded_len
+
     @property
     def input_types(self) -> Optional[Dict[str, NeuralType]]:
         if hasattr(self.preprocessor, '_sample_rate'):
@@ -577,11 +566,10 @@ class EncDecHybridRNNTCTCBPEModelAST(EncDecHybridRNNTCTCModel, ASRBPEMixin):
             "input_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
             "processed_signal": NeuralType(('B', 'D', 'T'), SpectrogramType(), optional=True),
             "processed_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
-#            "lang_id": NeuralType(tuple('B'), EncodedRepresentation(), optional=True),
-            'lang_id': NeuralType(tuple('B'), LabelsType(), optional=True),
-#            "lang_id": NeuralType(('B',), LabelsType()), 
+            "lang_id": NeuralType(tuple('B'), LabelsType(), optional=True),
             "sample_id": NeuralType(tuple('B'), LengthsType(), optional=True)
-        }    
+        }
+
     def training_step(self, batch, batch_nb):
         # Reset access registry
         if AccessMixin.is_access_enabled():
@@ -591,6 +579,7 @@ class EncDecHybridRNNTCTCBPEModelAST(EncDecHybridRNNTCTCModel, ASRBPEMixin):
             AccessMixin.set_access_enabled(access_enabled=True)
 
         signal, signal_len, transcript, transcript_len, lang_id = batch
+
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
             encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
@@ -977,16 +966,5 @@ class EncDecHybridRNNTCTCBPEModelAST(EncDecHybridRNNTCTCModel, ASRBPEMixin):
             input = torch.concat([lang, audio], dim=2)
             input_len += 1
         else:
-            mask = ~lens_to_mask(input_len, input.shape[2])
-            if self.insertion_method == "expand":
-                lang = lang.expand(-1, -1, audio.shape[-1])
-                lang = lang.masked_fill(mask.unsqueeze(1), 0.0)
-                input = torch.concat([audio, lang], dim=1)
-                input = self.insertion_proj(input.transpose(1,2)).transpose(1,2)
-            elif self.insertion_method == "add":
-                lang = lang.expand_as(input)
-                lang = lang.masked_fill(mask.unsqueeze(1), 0.0)
-                input = input + lang
-            else:
-                raise NameError
+            raise NameError
         return input, input_len
