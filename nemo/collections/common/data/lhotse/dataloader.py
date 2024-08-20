@@ -29,7 +29,7 @@ from lhotse.dataset import (
     IterableDatasetWrapper,
     make_worker_init_fn,
 )
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, ListConfig, OmegaConf
 
 from nemo.collections.common.data.lhotse.cutset import read_cutset_from_config
 
@@ -85,7 +85,11 @@ class LhotseDataLoadingConfig:
     noise_mix_prob: float = 0.5
     #   b. On-the-fly 3-way speed perturbation.
     perturb_speed: bool = False
-    #   c. Cut concatenation (glue together multiple utterances into a single one)
+    #   c. Narrow band augmentation
+    resample_augmentation: bool = False
+    resampling_probability: float = 0.5
+    resampling_rate: float = 8000
+    #   d. Cut concatenation (glue together multiple utterances into a single one)
     concatenate_samples: bool = False
     concatenate_gap_seconds: float = 0.1
     concatenate_duration_factor: float = 1.0
@@ -129,10 +133,13 @@ def get_lhotse_dataloader_from_config(
 
     # 2. Optional augmentations.
     # 2.a. Noise mixing.
-    if config.noise_path is not None:
+    if config.noise_path is not None and 0 <= config.noise_mix_prob <= 1:
+        noise_snr = config.noise_snr
+        if isinstance(noise_snr, ListConfig):
+            noise_snr = list(noise_snr)            
         noise = CutSet.from_file(config.noise_path)
         cuts = cuts.mix(
-            cuts=noise, snr=config.noise_snr, mix_prob=config.noise_mix_prob, seed="trng", random_mix_offset=True
+            cuts=noise, snr=noise_snr, mix_prob=config.noise_mix_prob, seed="trng", random_mix_offset=True
         )
 
     # 2.b. On-the-fly speed perturbation.
@@ -141,6 +148,18 @@ def get_lhotse_dataloader_from_config(
     #    bucket allocation.
     if config.perturb_speed:
         cuts = CutSet.mux(cuts, cuts.perturb_speed(0.9), cuts.perturb_speed(1.1),)
+
+    # 2.c. On-the-fly Narrowband augmentation
+    if config.resample_augmentation and 0 <= config.resampling_probability <= 1:
+        if config.resampling_rate > config.sample_rate:
+            warnings.warn(f"{config.resampling_rate=} is greater than {config.sample_rate}.")
+        cuts = cuts.map(
+            ResamplingTransform(
+                config.sample_rate, config.resampling_rate, p=config.resampling_probability, seed="trng"
+            )
+        )
+    if config.resampling_probability > 1 or config.resampling_probability < 0:
+        warnings.warn(f"Not using ResamplingTransform since {config.resampling_probability=} is not in range [0,1]")
 
     # 3. The sampler.
     if config.use_bucketing:
@@ -276,3 +295,23 @@ def _normalize_loudness(cuts: CutSet, db_norm: float) -> CutSet:
 
 def _merge_supervisions(cuts: CutSet) -> CutSet:
     return cuts.merge_supervisions()
+
+class ResamplingTransform:
+    """Converts the input example with probability p to narrowband (default: 8kHz) and resamples back to the original sampling rate."""
+
+    def __init__(self, sampling_rate, resampling_rate=8000, p=0.5, seed=0):
+        self.sampling_rate = sampling_rate
+        self.resampling_rate = resampling_rate
+        self.p = p
+        self.seed = seed
+        self.rng = None
+
+    def __call__(self, cut):
+        self._maybe_init_rng()
+        if self.rng.uniform(0.0, 1.0) > self.p:
+            return cut
+        return cut.resample(self.resampling_rate).resample(self.sampling_rate)
+
+    def _maybe_init_rng(self):
+        if self.rng is None:
+            self.rng = random.Random(lhotse_resolve_seed(self.seed))

@@ -12,13 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import itertools
 import copy
 import os
 from typing import Dict, List, Optional, Union
+import pdb
 
 import torch
 from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
 from pytorch_lightning import Trainer
+from torchmetrics.text import SacreBLEUScore
+import torch.distributed as dist
 
 from nemo.collections.asr.data import audio_to_text_dataset
 from nemo.collections.asr.data.audio_to_text_dali import AudioToBPEDALIDataset, DALIOutputs
@@ -27,6 +31,7 @@ from nemo.collections.asr.data.audio_to_text_lhotse_lang_id import LhotseSpeechT
 from nemo.collections.asr.losses.ctc import CTCLoss
 from nemo.collections.asr.losses.rnnt import RNNTLoss
 from nemo.collections.asr.metrics.wer import WER
+from nemo.collections.asr.metrics.bleu import BLEU
 from nemo.core.classes.mixins import AccessMixin
 from nemo.collections.asr.models.hybrid_rnnt_ctc_models import EncDecHybridRNNTCTCModel
 from nemo.collections.asr.parts.mixins import ASRBPEMixin
@@ -121,6 +126,13 @@ class EncDecHybridRNNTCTCBPEModelAST(EncDecHybridRNNTCTCModel, ASRBPEMixin):
             use_cer=self.cfg.get('use_cer', False),
             log_prediction=self.cfg.get('log_prediction', True),
             dist_sync_on_step=True,
+        )
+
+        # Setup bleu object
+        self.bleu = BLEU(
+            decoding=self.decoding,
+            tokenize=self.cfg.get('bleu_tokenizer', "13a"),
+            log_prediction=True
         )
 
         # Setup fused Joint step if flag is set
@@ -786,6 +798,8 @@ class EncDecHybridRNNTCTCBPEModelAST(EncDecHybridRNNTCTCModel, ASRBPEMixin):
             tensorboard_logs['val_rnnt_loss'] = loss_value
             loss_value = (1 - self.ctc_loss_weight) * loss_value + self.ctc_loss_weight * ctc_loss
             tensorboard_logs['val_loss'] = loss_value
+
+        # CTC WER calculation
         self.ctc_wer.update(
             predictions=log_probs, targets=transcript, targets_lengths=transcript_len, predictions_lengths=encoded_len,
         )
@@ -795,8 +809,26 @@ class EncDecHybridRNNTCTCBPEModelAST(EncDecHybridRNNTCTCModel, ASRBPEMixin):
         tensorboard_logs['val_wer_denom_ctc'] = ctc_wer_denom
         tensorboard_logs['val_wer_ctc'] = ctc_wer
 
+        # BLEU score calculation
+        self.bleu.update(
+            predictions=encoded,
+            predictions_lengths=encoded_len,
+            targets=transcript,
+            targets_lengths=transcript_len
+        )
+        bleu_metrics = self.bleu.compute(return_all_metrics=True, prefix="val_")
+        tensorboard_logs.update({
+            'val_bleu_num': bleu_metrics['val_bleu_num'],
+            'val_bleu_denom': bleu_metrics['val_bleu_denom'],
+            'val_bleu_pred_len': bleu_metrics['val_bleu_pred_len'],
+            'val_bleu_target_len': bleu_metrics['val_bleu_target_len'],
+            'val_bleu': bleu_metrics['val_bleu']
+        })
+        self.bleu.reset()
+
         self.log('global_step', torch.tensor(self.trainer.global_step, dtype=torch.float32))
 
+        # Inter-CTC losses and additional logging
         loss_value, additional_logs = self.add_interctc_losses(
             loss_value,
             transcript,
@@ -811,6 +843,7 @@ class EncDecHybridRNNTCTCBPEModelAST(EncDecHybridRNNTCTCModel, ASRBPEMixin):
             # rnnt + ctc loss is available in metrics as "val_final_loss" now
             tensorboard_logs['val_loss'] = loss_value
         tensorboard_logs.update(additional_logs)
+
         # Reset access registry
         if AccessMixin.is_access_enabled():
             AccessMixin.reset_registry(self)
@@ -834,6 +867,41 @@ class EncDecHybridRNNTCTCBPEModelAST(EncDecHybridRNNTCTCModel, ASRBPEMixin):
         else:
             self.test_step_outputs.append(test_logs)
         return test_logs
+
+    def multi_validation_epoch_end(self, outputs, dataloader_idx: int = 0):
+        # Calculate validation loss if required
+        if self.compute_eval_loss:
+            val_loss_mean = torch.stack([x['val_loss'] for x in outputs]).mean()
+            val_loss_log = {'val_loss': val_loss_mean}
+        else:
+            val_loss_log = {}
+
+        # Calculate WER
+        wer_num = torch.stack([x['val_wer_num'] for x in outputs]).sum()
+        wer_denom = torch.stack([x['val_wer_denom'] for x in outputs]).sum()
+        tensorboard_logs = {**val_loss_log, 'val_wer': wer_num.float() / wer_denom}
+
+        # Calculate CTC WER if applicable
+        if self.ctc_loss_weight > 0:
+            ctc_wer_num = torch.stack([x['val_wer_num_ctc'] for x in outputs]).sum()
+            ctc_wer_denom = torch.stack([x['val_wer_denom_ctc'] for x in outputs]).sum()
+            tensorboard_logs['val_wer_ctc'] = ctc_wer_num.float() / ctc_wer_denom
+
+        # Calculate BLEU score
+        bleu_num = torch.stack([x['val_bleu_num'] for x in outputs]).sum(dim=0)
+        bleu_denom = torch.stack([x['val_bleu_denom'] for x in outputs]).sum(dim=0)
+        bleu_pred_len = torch.stack([x['val_bleu_pred_len'] for x in outputs]).sum(dim=0)
+        bleu_target_len = torch.stack([x['val_bleu_target_len'] for x in outputs]).sum(dim=0)
+
+        val_bleu = self.bleu._compute_bleu(bleu_pred_len, bleu_target_len, bleu_num, bleu_denom)
+        tensorboard_logs['val_bleu'] = val_bleu
+
+        # Finalize and log metrics
+        metrics = {**val_loss_log, 'log': tensorboard_logs}
+        self.finalize_interctc_metrics(metrics, outputs, prefix="val_")
+        
+        return metrics
+
 
     @classmethod
     def list_available_models(cls) -> List[PretrainedModelInfo]:
@@ -968,3 +1036,11 @@ class EncDecHybridRNNTCTCBPEModelAST(EncDecHybridRNNTCTCModel, ASRBPEMixin):
         else:
             raise NameError
         return input, input_len
+        
+    @property
+    def bleu(self):
+        return self._bleu
+
+    @bleu.setter
+    def bleu(self, bleu):
+        self._bleu = bleu
