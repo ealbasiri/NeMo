@@ -23,23 +23,23 @@ from pytorch_lightning import Trainer
 from nemo.collections.asr.data import audio_to_text_dataset
 from nemo.collections.asr.data.audio_to_text import _AudioTextDataset
 from nemo.collections.asr.data.audio_to_text_dali import AudioToBPEDALIDataset, DALIOutputs
-from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset, LhotseSpeechToTextBpeDatasetTgtLangID
+from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset
+from nemo.collections.asr.data.audio_to_text_lhotse_target_language import LhotseSpeechToTextBpeDatasetTgtLangID
 from nemo.collections.asr.losses.rnnt import RNNTLoss
 from nemo.collections.asr.metrics.wer import WER
 from nemo.collections.asr.metrics.bleu import BLEU
 from nemo.core.classes.mixins import AccessMixin
-from nemo.collections.asr.models.rnnt_models import EncDecRNNTBPEModel
+from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
 from nemo.collections.asr.parts.mixins import ASRBPEMixin
 from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTBPEDecoding, RNNTBPEDecodingConfig
-from nemo.collections.asr.parts.utils.asr_batching import get_semi_sorted_batch_sampler
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.core.classes.common import PretrainedModelInfo, typecheck
 from nemo.utils import logging, model_utils
-from nemo.core.neural_types import AudioSignal, LengthsType, NeuralType, SpectrogramType, LabelsType
+from nemo.core.neural_types import AudioSignal, LengthsType, NeuralType, SpectrogramType, LabelsType, AcousticEncodedRepresentation
 
 #this is a copy of RNNT model on latest main 
 
-class EncDecRNNTBPEModelLangID(EncDecRNNTBPEModel, ASRBPEMixin):
+class EncDecRNNTBPEModelTgtLangID(EncDecRNNTBPEModel, ASRBPEMixin):
     """Base class for encoder decoder RNNT-based models with subword tokenization."""
 
     @classmethod
@@ -317,16 +317,14 @@ class EncDecRNNTBPEModelLangID(EncDecRNNTBPEModel, ASRBPEMixin):
             cfg.joint.jointnet.pred_hidden = cfg.model_defaults.pred_hidden
 
         super().__init__(cfg=cfg, trainer=trainer)
-
-            if cfg.get("initialize_target_lang_id_concatination", False):
-                self.initialize_target_lang_concat()
+        
+        if cfg.get("initialize_target_lang_id_concatination", False):
+            self.initialize_target_lang_id_concatination()
 
     def initialize_target_lang_id_concatination(self):
         """Initialize model components for target language ID concatenation."""
         print("target language model has been initalized")  
 
-        # Setup decoding config 
-        self.cfg.decoding = self.set_decoding_type_according_to_loss(self.cfg.decoding)
         # Setup decoding object
         self.decoding = RNNTBPEDecoding(
             decoding_cfg=self.cfg.decoding,
@@ -366,27 +364,21 @@ class EncDecRNNTBPEModelLangID(EncDecRNNTBPEModel, ASRBPEMixin):
                 self.asr_norm = torch.nn.LayerNorm(self._cfg.model_defaults.enc_hidden)
                 self.lang_norm = torch.nn.LayerNorm(self.num_langs)
 
-            self.kernel_norm = self._cfg.get('kernel_norm', None)
-            self.lang_kernel_type = self._cfg.get('lang_kernel_type', None)
 
             # Setup projection layers
             proj_in_size = self.num_langs + self._cfg.model_defaults.enc_hidden
             proj_out_size = self._cfg.model_defaults.enc_hidden
             
-            self.joint_proj = torch.nn.Sequential(
+            self.lang_kernal = torch.nn.Sequential(
                 torch.nn.Linear(proj_in_size, proj_out_size * 2),
                 torch.nn.ReLU(),
                 torch.nn.Linear(proj_out_size * 2, proj_out_size)
             )
-            self.lang_kernal = self.joint_proj
 
 
             # For later application
             # if self.lang_kernel_type == 'sinusoidal':
             #     self.lang_kernel = self.get_sinusoid_position_encoding(self.num_langs, cfg.model_defaults.enc_hidden)              
-
-        else:
-            self.concat = False
 
     def _setup_dataloader_from_config(self, config: Optional[Dict]):
         if config.get("use_lhotse"):
@@ -453,7 +445,7 @@ class EncDecRNNTBPEModelLangID(EncDecRNNTBPEModel, ASRBPEMixin):
             "processed_signal": NeuralType(('B', 'D', 'T'), SpectrogramType(), optional=True),
             "processed_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
             'sample_id': NeuralType(tuple('B'), LengthsType(), optional=True),
-            'target_lang_id': NeuralType(('B', 'T'), LabelsType()),
+            'target_lang_id': NeuralType(('B', 'T', 'D'), LabelsType()),
         }
 
     @property
@@ -539,7 +531,7 @@ class EncDecRNNTBPEModelLangID(EncDecRNNTBPEModel, ASRBPEMixin):
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
             encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, target_lang_id)
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, target_lang_id=target_lang_id)
         del signal
 
         # During training, loss must be computed, so decoder forward is necessary

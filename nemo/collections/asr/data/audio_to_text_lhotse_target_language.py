@@ -24,7 +24,7 @@ class LhotseSpeechToTextBpeDatasetTgtLangID(torch.utils.data.Dataset):
             'transcripts': NeuralType(('B', 'T'), LabelsType()),
             'transcript_length': NeuralType(tuple('B'), LengthsType()),
             'sample_id': NeuralType(tuple('B'), LengthsType(), optional=True),
-            'target_lang_id': NeuralType(('B', 'T'), LabelsType()),
+            'target_lang_id': NeuralType(('B', 'T', 'D'), LabelsType())
         }
     
     def __init__(self, tokenizer, cfg):
@@ -76,7 +76,7 @@ class LhotseSpeechToTextBpeDatasetTgtLangID(torch.utils.data.Dataset):
         return mask
 
     # this function is taken from nemo.collections.asr.parts.utils.asr_multispeaker_utils import get_hidden_length_from_sample_length        
-    def get_hidden_length_from_sample_length(
+    def get_hidden_length_from_sample_length(self,
         num_samples: int, 
         num_sample_per_mel_frame: int = 160, 
         num_mel_frame_per_asr_frame: int = 8
