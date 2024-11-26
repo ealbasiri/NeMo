@@ -19,7 +19,8 @@ import shutil
 import tarfile
 import tempfile
 import uuid
-from typing import Optional, Set, Union
+from contextlib import contextmanager
+from typing import Callable, Generator, Optional, Set, Union
 
 import torch
 from omegaconf import DictConfig, OmegaConf
@@ -38,6 +39,7 @@ class SaveRestoreConnector:
         self._model_config_yaml = "model_config.yaml"
         self._model_weights_ckpt = "model_weights.ckpt"
         self._model_extracted_dir = None
+        self._pack_nemo_file = True
 
     def save_to(self, model: "nemo_classes.ModelPT", save_path: str):
         """
@@ -51,6 +53,10 @@ class SaveRestoreConnector:
         Args:
             model: ModelPT object to be saved.
             save_path: Path to .nemo file where model instance should be saved
+
+        Returns:
+            str: Path to .nemo file where model instance was saved (same as save_path argument) or None if not rank 0
+                The path can be a directory if the flag `pack_nemo_file` is set to False.
         """
 
         if is_global_rank_zero():
@@ -65,7 +71,16 @@ class SaveRestoreConnector:
                     # We should not update self._cfg here - the model can still be in use
                     self._update_artifact_paths(model, path2yaml_file=config_yaml)
                 self._save_state_dict_to_disk(model.state_dict(), model_weights)
-                self._make_nemo_file_from_folder(filename=save_path, source_dir=tmpdir)
+
+                # Check if we are packing the folder into a nemo file
+                if self.pack_nemo_file:
+                    self._make_nemo_file_from_folder(filename=save_path, source_dir=tmpdir)
+                else:
+                    # Get the folder path from the save_path and move all values inside the tmpdir to the folder
+                    folder_path = os.path.dirname(save_path)
+
+                    for file in os.listdir(tmpdir):
+                        shutil.move(os.path.join(tmpdir, file), folder_path)
         else:
             return
 
@@ -78,6 +93,7 @@ class SaveRestoreConnector:
         strict: bool = True,
         return_config: bool = False,
         trainer: Trainer = None,
+        validate_access_integrity: bool = True,
     ):
         """
         Restores model instance (weights and configuration) into .nemo file
@@ -126,9 +142,11 @@ class SaveRestoreConnector:
 
                 else:
                     # Extract the nemo file into the temporary directory
-                    self._unpack_nemo_file(
-                        path2file=restore_path, out_folder=tmpdir, extract_config_only=return_config is True
-                    )
+                    filter_fn = None
+                    if return_config:
+                        filter_fn = lambda name: '.yaml' in name
+                    members = self._filtered_tar_info(restore_path, filter_fn=filter_fn)
+                    self._unpack_nemo_file(path2file=restore_path, out_folder=tmpdir, members=members)
 
                 # Change current working directory to
                 os.chdir(tmpdir)
@@ -212,6 +230,7 @@ class SaveRestoreConnector:
         strict: bool = True,
         return_config: bool = False,
         trainer: Trainer = None,
+        validate_access_integrity: bool = True,
     ):
         """
         Restores model instance (weights and configuration) into .nemo file
@@ -239,7 +258,14 @@ class SaveRestoreConnector:
         # Get path where the command is executed - the artifacts will be "retrieved" there
         # (original .nemo behavior)
         loaded_params = self.load_config_and_state_dict(
-            calling_cls, restore_path, override_config_path, map_location, strict, return_config, trainer,
+            calling_cls,
+            restore_path,
+            override_config_path,
+            map_location,
+            strict,
+            return_config,
+            trainer,
+            validate_access_integrity,
         )
         if not isinstance(loaded_params, tuple) or return_config is True:
             return loaded_params
@@ -462,6 +488,29 @@ class SaveRestoreConnector:
             # TODO: see cases when this can occur, and if we can fix them
             logging.warning("Model contains registered artifacts, but no restoration paths found")
         if len(tarfile_artifacts) > 0 and len(restoration_paths) > 0:
+
+            def check_artifact_and_query_basename_match(query_path: str) -> bool:
+                for _, artiitem in tarfile_artifacts:
+                    # Get basename and copy it to nemo_file_folder
+                    if 'nemo:' in artiitem.path:
+                        artifact_base_name = artiitem.path.split('nemo:')[1]
+                    else:
+                        artifact_base_name = os.path.basename(artiitem.path)
+
+                    if artifact_base_name == os.path.basename(query_path):
+                        return True
+                return False
+
+            artifact_rel_paths = {}
+            for path in restoration_paths:
+                if self.model_extracted_dir:
+                    artifact_rel_paths[path] = self._filtered_recursive_walk(
+                        path, filter_fn=check_artifact_and_query_basename_match
+                    )
+                else:
+                    artifact_rel_paths[path] = self._filtered_tar_info(
+                        path, filter_fn=check_artifact_and_query_basename_match
+                    )
             # Need to step into nemo archive to extract file
             # Get path where the command is executed - the artifacts will be "retrieved" there
             # (original .nemo behavior)
@@ -470,13 +519,16 @@ class SaveRestoreConnector:
             # TemporaryDirectory context must always be outer to try-catch chdir otherwise it crashes on Windows
             with tempfile.TemporaryDirectory() as archive_dir:
                 try:
-                    # unpack all restorations paths (nemo checkpoints)
+                    # unpack artifacts from all restorations paths (nemo checkpoints)
                     # in nemo checkpoints all resources contain hash in name, so there should be no collisions
                     for path in restoration_paths:
                         if self.model_extracted_dir:
-                            shutil.copytree(src=path, dst=archive_dir, dirs_exist_ok=True)
+                            for rel_path in artifact_rel_paths[path]:
+                                shutil.copy2(src=rel_path, dst=archive_dir)
                         else:
-                            self._unpack_nemo_file(path2file=path, out_folder=archive_dir)
+                            self._unpack_nemo_file(
+                                path2file=path, out_folder=archive_dir, members=artifact_rel_paths[path]
+                            )
                     os.chdir(archive_dir)
                     for conf_path, artiitem in tarfile_artifacts:
                         # Get basename and copy it to nemo_file_folder
@@ -540,7 +592,59 @@ class SaveRestoreConnector:
             tar.add(source_dir, arcname=".")
 
     @staticmethod
-    def _unpack_nemo_file(path2file: str, out_folder: str, extract_config_only: bool = False) -> str:
+    def _is_safe_path(member, extract_to):
+        # Check for path traversal characters or absolute paths
+        member_path = os.path.normpath(member.name)
+        # Ensure the path does not start with a slash or contain ".." after normalization
+        if os.path.isabs(member_path) or ".." in member_path.split(os.sep):
+            return False
+        # Construct the full path where the member would be extracted
+        full_path = os.path.join(extract_to, member_path)
+        # Ensure the member would be extracted within the intended directory
+        return os.path.commonprefix([full_path, extract_to]) == extract_to
+
+    @staticmethod
+    def _safe_extract(tar, out_folder: str, members=None):
+        extract_to = os.path.realpath(out_folder)
+        if members is None:
+            members = tar.getmembers()
+        for member in members:
+            if SaveRestoreConnector._is_safe_path(member, extract_to):
+                tar.extract(member, extract_to)
+            else:
+                logging.warning(f"Skipping potentially unsafe member: {member.name}")
+
+    @staticmethod
+    def _filtered_tar_info(tar_path: str, filter_fn: Optional[Callable[[str], bool]] = None) -> list[tarfile.TarInfo]:
+        """
+        Returns the members of the tarball filtered by a function
+        """
+        with SaveRestoreConnector._tar_open(tar_path) as tar:
+            members = tar.getmembers()
+            if filter_fn is None:
+                return members
+
+            return [x for x in members if filter_fn(x.name)]
+
+    @staticmethod
+    def _filtered_recursive_walk(path: str, filter_fn: Optional[Callable[[str], bool]] = None) -> list[str]:
+        """
+        Returns the result of recursive walking a path and filtering each element
+        """
+        if not os.path.isdir(path):
+            raise NotADirectoryError(f"Expected {path=} to be a directory")
+
+        filtered_rel_paths = []
+        for root, _, files in os.walk(path):
+            for f in files:
+                full_rel_path = os.path.join(root, f)
+                if filter_fn is None or filter_fn(full_rel_path):
+                    filtered_rel_paths.append(full_rel_path)
+        return filtered_rel_paths
+
+    @staticmethod
+    @contextmanager
+    def _tar_open(path2file: str) -> Generator[tarfile.TarFile, None, None]:
         if not os.path.exists(path2file):
             raise FileNotFoundError(f"{path2file} does not exist")
 
@@ -553,13 +657,20 @@ class SaveRestoreConnector:
         except tarfile.ReadError:
             # can be older checkpoint => try compressed tar
             tar_header = "r:gz"
+
         tar = tarfile.open(path2file, tar_header)
-        if not extract_config_only:
-            tar.extractall(path=out_folder)
-        else:
-            members = [x for x in tar.getmembers() if ".yaml" in x.name]
-            tar.extractall(path=out_folder, members=members)
-        tar.close()
+        try:
+            yield tar
+        finally:
+            tar.close()
+
+    @staticmethod
+    def _unpack_nemo_file(path2file: str, out_folder: str, members: Optional[list[str]] = None) -> str:
+        with SaveRestoreConnector._tar_open(path2file) as tar:
+            if members is None:
+                SaveRestoreConnector._safe_extract(tar, out_folder)
+            else:
+                SaveRestoreConnector._safe_extract(tar, out_folder, members)
         return out_folder
 
     @staticmethod
@@ -593,3 +704,11 @@ class SaveRestoreConnector:
     @model_extracted_dir.setter
     def model_extracted_dir(self, path: Optional[str]):
         self._model_extracted_dir = path
+
+    @property
+    def pack_nemo_file(self) -> bool:
+        return self._pack_nemo_file
+
+    @pack_nemo_file.setter
+    def pack_nemo_file(self, save_nemo_file: bool):
+        self._pack_nemo_file = save_nemo_file
