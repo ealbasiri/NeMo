@@ -39,7 +39,7 @@ from nemo.core.neural_types import AudioSignal, LengthsType, NeuralType, Spectro
 
 #this is a copy of RNNT model on latest main 
 
-class EncDecRNNTBPEModelTgtLangID(EncDecRNNTBPEModel, ASRBPEMixin):
+class EncDecRNNTBPEModelTgtLangIDDebug(EncDecRNNTBPEModel, ASRBPEMixin):
     """Base class for encoder decoder RNNT-based models with subword tokenization."""
 
     @classmethod
@@ -346,7 +346,8 @@ class EncDecRNNTBPEModelTgtLangID(EncDecRNNTBPEModel, ASRBPEMixin):
         self.bleu = BLEU(
             decoding=self.decoding,
             tokenize=self.cfg.get('bleu_tokenizer', "13a"),
-            log_prediction=True
+            log_prediction=True,
+            dist_sync_on_step=True,
         )
 
         # Setup fused Joint step if flag is set
@@ -635,94 +636,265 @@ class EncDecRNNTBPEModelTgtLangID(EncDecRNNTBPEModel, ASRBPEMixin):
         sample_id = sample_id.cpu().detach().numpy()
         return list(zip(sample_id, best_hyp_text))
 
+    # def validation_pass(self, batch, batch_idx, dataloader_idx=0):
+
+    #     signal, signal_len, transcript, transcript_len, target_lang_id = batch
+
+    #     # forward() only performs encoder forward
+    #     if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
+    #         encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
+    #     else:
+    #         encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, target_lang_id=target_lang_id)
+    #     del signal
+
+    #     tensorboard_logs = {}
+
+    #     # If experimental fused Joint-Loss-WER is not used
+    #     if not self.joint.fuse_loss_wer:
+    #         if self.compute_eval_loss:
+    #             decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
+    #             joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
+
+    #             loss_value = self.loss(
+    #                 log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
+    #             )
+
+    #             tensorboard_logs['val_loss'] = loss_value
+
+    #         self.wer.update(
+    #             predictions=encoded,
+    #             predictions_lengths=encoded_len,
+    #             targets=transcript,
+    #             targets_lengths=transcript_len,
+    #         )
+    #         wer, wer_num, wer_denom = self.wer.compute()
+    #         self.wer.reset()
+
+    #         tensorboard_logs['val_wer_num'] = wer_num
+    #         tensorboard_logs['val_wer_denom'] = wer_denom
+    #         tensorboard_logs['val_wer'] = wer
+
+    #     else:
+    #         # If experimental fused Joint-Loss-WER is used
+    #         compute_wer = True
+
+    #         if self.compute_eval_loss:
+    #             decoded, target_len, states = self.decoder(targets=transcript, target_length=transcript_len)
+    #         else:
+    #             decoded = None
+    #             target_len = transcript_len
+
+    #         # Fused joint step
+    #         loss_value, wer, wer_num, wer_denom = self.joint(
+    #             encoder_outputs=encoded,
+    #             decoder_outputs=decoded,
+    #             encoder_lengths=encoded_len,
+    #             transcripts=transcript,
+    #             transcript_lengths=target_len,
+    #             compute_wer=compute_wer,
+    #         )
+
+    #         if loss_value is not None:
+    #             tensorboard_logs['val_loss'] = loss_value
+
+    #         tensorboard_logs['val_wer_num'] = wer_num
+    #         tensorboard_logs['val_wer_denom'] = wer_denom
+    #         tensorboard_logs['val_wer'] = wer
+
+    #     # BLEU score calculation
+    #     self.bleu.update(
+    #         predictions=encoded,
+    #         predictions_lengths=encoded_len,
+    #         targets=transcript,
+    #         targets_lengths=transcript_len
+    #     )
+    #     #here is the distributed 
+    #     bleu_metrics = self.bleu.compute(return_all_metrics=True, prefix="val_")
+
+    #     tensorboard_logs.update({
+    #         'val_bleu_num': bleu_metrics['val_bleu_num'],
+    #         'val_bleu_denom': bleu_metrics['val_bleu_denom'],
+    #         'val_bleu_pred_len': bleu_metrics['val_bleu_pred_len'],
+    #         'val_bleu_target_len': bleu_metrics['val_bleu_target_len'],
+    #         'val_bleu': bleu_metrics['val_bleu']
+    #     })
+    #     self.bleu.reset()
+
+    #     self.log('global_step', torch.tensor(self.trainer.global_step, dtype=torch.float32))
+
+    #     return tensorboard_logs
+
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
+        """Validation step - calculate metrics with distributed computation."""
+        try:
+            print(f"GPU {self.global_rank} starting validation - batch_idx: {batch_idx}")
+            
+            # Unpack batch and clear GPU memory where possible
+            signal, signal_len, transcript, transcript_len, target_lang_id = batch
+            print(f"GPU {self.global_rank} batch shapes:", {
+                "signal": signal.shape,
+                "signal_len": signal_len.shape,
+                "transcript": transcript.shape,
+                "transcript_len": transcript_len.shape,
+                "target_lang_id": target_lang_id.shape
+            })
 
-        signal, signal_len, transcript, transcript_len, target_lang_id = batch
-
-        # forward() only performs encoder forward
-        if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
-            encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
-        else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, target_lang_id=target_lang_id)
-        del signal
-
-        tensorboard_logs = {}
-
-        # If experimental fused Joint-Loss-WER is not used
-        if not self.joint.fuse_loss_wer:
-            if self.compute_eval_loss:
-                decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
-                joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
-
-                loss_value = self.loss(
-                    log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
-                )
-
-                tensorboard_logs['val_loss'] = loss_value
-
-            self.wer.update(
-                predictions=encoded,
-                predictions_lengths=encoded_len,
-                targets=transcript,
-                targets_lengths=transcript_len,
-            )
-            wer, wer_num, wer_denom = self.wer.compute()
-            self.wer.reset()
-
-            tensorboard_logs['val_wer_num'] = wer_num
-            tensorboard_logs['val_wer_denom'] = wer_denom
-            tensorboard_logs['val_wer'] = wer
-
-        else:
-            # If experimental fused Joint-Loss-WER is used
-            compute_wer = True
-
-            if self.compute_eval_loss:
-                decoded, target_len, states = self.decoder(targets=transcript, target_length=transcript_len)
+            # Debug memory before forward pass
+            print(f"GPU {self.global_rank} - Memory before forward pass: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+            
+            # Forward pass
+            if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
+                print(f"GPU {self.global_rank} - Using processed signal")
+                encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
             else:
-                decoded = None
-                target_len = transcript_len
+                print(f"GPU {self.global_rank} - Using raw signal")
+                encoded, encoded_len = self.forward(
+                    input_signal=signal,
+                    input_signal_length=signal_len,
+                    target_lang_id=target_lang_id
+                )
+            
+            print(f"GPU {self.global_rank} encoded shape: {encoded.shape}, encoded_len: {encoded_len.shape}")
+            print(f"GPU {self.global_rank} - Memory after forward pass: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+            del signal
 
-            # Fused joint step
-            loss_value, wer, wer_num, wer_denom = self.joint(
-                encoder_outputs=encoded,
-                decoder_outputs=decoded,
-                encoder_lengths=encoded_len,
-                transcripts=transcript,
-                transcript_lengths=target_len,
-                compute_wer=compute_wer,
-            )
+            # Calculate metrics
+            if not self.joint.fuse_loss_wer:
+                print(f"GPU {self.global_rank} - Using non-fused loss calculation")
+                if self.compute_eval_loss:
+                    decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
+                    joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
+                    loss_value = self.loss(
+                        log_probs=joint,
+                        targets=transcript,
+                        input_lengths=encoded_len,
+                        target_lengths=target_length
+                    )
+                    self.log('val_loss', loss_value, sync_dist=True)
+                    
+                # Compute WER
+                self.wer.update(
+                    predictions=encoded,
+                    predictions_lengths=encoded_len,
+                    targets=transcript,
+                    targets_lengths=transcript_len,
+                )
+                wer, wer_num, wer_denom = self.wer.compute()
+                self.wer.reset()
+                
+                # Log WER metrics
+                self.log('val_wer', wer, sync_dist=True)
+                self.log('val_wer_num', wer_num, sync_dist=True)
+                self.log('val_wer_denom', wer_denom, sync_dist=True)
+            else:
+                print(f"GPU {self.global_rank} - Starting fused loss calculation")
+                # Debug sync point
+                torch.distributed.barrier()
+                print(f"GPU {self.global_rank} - All GPUs synchronized before fused calculation")
+                
+                compute_wer = True
+                if self.compute_eval_loss:
+                    print(f"GPU {self.global_rank} - Computing decoder outputs")
+                    decoded, target_len, states = self.decoder(targets=transcript, target_length=transcript_len)
+                    print(f"GPU {self.global_rank} - Decoder output shapes:",
+                        f"decoded: {decoded.shape}, target_len: {target_len.shape}")
+                else:
+                    decoded = None
+                    target_len = transcript_len
+                    print(f"GPU {self.global_rank} - Skipping decoder, using transcript_len directly")
 
-            if loss_value is not None:
-                tensorboard_logs['val_loss'] = loss_value
+                print(f"GPU {self.global_rank} - Memory before joint calculation: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+                print(f"GPU {self.global_rank} - Joint calculation tensor stats:",
+                    f"\nencoder_outputs min/max: {encoded.min().item():.3f}/{encoded.max().item():.3f}",
+                    f"\nencoder_lengths unique values: {encoded_len.unique().tolist()}",
+                    f"\ntranscript_lengths unique values: {target_len.unique().tolist()}")
 
-            tensorboard_logs['val_wer_num'] = wer_num
-            tensorboard_logs['val_wer_denom'] = wer_denom
-            tensorboard_logs['val_wer'] = wer
+                # Before joint call:
+                torch.cuda.synchronize()  # Ensure previous operations are complete
+                print(f"GPU {self.global_rank} - Pre-joint CUDA memory: {torch.cuda.memory_allocated()/1e9:.2f}GB")
 
-        # BLEU score calculation
-        self.bleu.update(
-            predictions=encoded,
-            predictions_lengths=encoded_len,
-            targets=transcript,
-            targets_lengths=transcript_len
-        )
-        #here is the distributed 
-        bleu_metrics = self.bleu.compute(return_all_metrics=True, prefix="val_")
+                # Calculate fused metrics
+                try:
+                    print(f"GPU {self.global_rank} - Starting joint calculation")
+                    loss_value, wer, wer_num, wer_denom = self.joint(
+                        encoder_outputs=encoded,
+                        decoder_outputs=decoded,
+                        encoder_lengths=encoded_len,
+                        transcripts=transcript,
+                        transcript_lengths=target_len,
+                        compute_wer=compute_wer,
+                    )
+                    print(f"GPU {self.global_rank} - Completed joint calculation")
+                except Exception as e:
+                    print(f"GPU {self.global_rank} - Exception in joint calculation: {str(e)}")
+                    print(f"GPU {self.global_rank} - Input shapes to joint:",
+                        f"\nencoder_outputs: {encoded.shape}",
+                        f"\ndecoder_outputs: {None if decoded is None else decoded.shape}",
+                        f"\nencoder_lengths: {encoded_len.shape}",
+                        f"\ntranscripts: {transcript.shape}",
+                        f"\ntranscript_lengths: {target_len.shape}")
+                    raise
 
-        tensorboard_logs.update({
-            'val_bleu_num': bleu_metrics['val_bleu_num'],
-            'val_bleu_denom': bleu_metrics['val_bleu_denom'],
-            'val_bleu_pred_len': bleu_metrics['val_bleu_pred_len'],
-            'val_bleu_target_len': bleu_metrics['val_bleu_target_len'],
-            'val_bleu': bleu_metrics['val_bleu']
-        })
-        self.bleu.reset()
+                # Debug sync point
+                torch.distributed.barrier()
+                print(f"GPU {self.global_rank} - All GPUs synchronized after joint calculation")
 
-        self.log('global_step', torch.tensor(self.trainer.global_step, dtype=torch.float32))
+                if loss_value is not None:
+                    print(f"GPU {self.global_rank} - Logging val_loss: {loss_value.item()}")
+                    self.log('val_loss', loss_value, sync_dist=True)
+                
+                # Log WER metrics
+                print(f"GPU {self.global_rank} - Logging WER metrics: {wer}")
+                self.log('val_wer', wer, sync_dist=True)
+                self.log('val_wer_num', wer_num, sync_dist=True)
+                self.log('val_wer_denom', wer_denom, sync_dist=True)
 
-        return tensorboard_logs
+                print(f"GPU {self.global_rank} - Completed WER validation_pass for batch {batch_idx}")
+                # BLEU score calculation
+                print(f"GPU {self.global_rank} starting BLEU computation")
+                try:
+                    # Reset metric state
+                    self.bleu.reset()
+                    
+                    # Synchronize before metric computation
+                    torch.cuda.synchronize()
+                    
+                    # Update BLEU state with current batch
+                    self.bleu.update(
+                        predictions=encoded,
+                        predictions_lengths=encoded_len,
+                        targets=transcript,
+                        targets_lengths=transcript_len
+                    )
+                    
+                    # Synchronize before computing final values
+                    torch.cuda.synchronize()
+                    
+                    # Compute and log all BLEU metrics
+                    bleu_metrics = self.bleu.compute(return_all_metrics=True, prefix="val_")
+                    for k, v in bleu_metrics.items():
+                        self.log('val_bleu_num', v.mean(), sync_dist=True)
 
+                    # self.log(k, v, sync_dist=True)
+                    
+                    print(f"GPU {self.global_rank} BLEU score: {bleu_metrics['val_bleu']}")
+
+                except Exception as e:
+                    print(f"GPU {self.global_rank} BLEU computation failed: {str(e)}")
+                    print(f"GPU {self.global_rank} traceback: {traceback.format_exc()}")
+                    self.bleu.reset()
+                    raise
+
+                # Log global step
+                self.log('global_step', torch.tensor(self.trainer.global_step, dtype=torch.float32), sync_dist=True)
+                
+                print(f"GPU {self.global_rank} validation complete")
+                return {}
+
+        except Exception as e:
+            print(f"GPU {self.global_rank} validation failed with error: {str(e)}")
+            print(f"GPU {self.global_rank} traceback: {traceback.format_exc()}")
+            raise
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         metrics = self.validation_pass(batch, batch_idx, dataloader_idx)
         if type(self.trainer.val_dataloaders) == list and len(self.trainer.val_dataloaders) > 1:

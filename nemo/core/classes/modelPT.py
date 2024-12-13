@@ -1025,7 +1025,8 @@ class ModelPT(LightningModule, Model):
                 self.validation_step_outputs[dataloader_idx].clear()  # free memory
 
             if 'log' in output_dict:
-                self.log_dict(output_dict.pop('log'), on_epoch=True)
+                # self.log_dict(output_dict.pop('log'), on_epoch=True)
+                self.log_dict(output_dict.pop('log'), on_epoch=True, sync_dist=True, reduce_fx='mean')
 
             # return everything else
             return output_dict
@@ -1118,7 +1119,8 @@ class ModelPT(LightningModule, Model):
                 self.test_step_outputs[dataloader_idx].clear()  # free memory
 
             if 'log' in output_dict:
-                self.log_dict(output_dict.pop('log'), on_epoch=True)
+                # self.log_dict(output_dict.pop('log'), on_epoch=True)
+                self.log_dict(output_dict.pop('log'), on_epoch=True, sync_dist=True, reduce_fx='mean')
 
             # return everything else
             return output_dict
