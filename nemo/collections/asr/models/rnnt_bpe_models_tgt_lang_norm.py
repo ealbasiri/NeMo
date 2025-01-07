@@ -14,21 +14,17 @@
 
 import copy
 import os
-import tempfile
-import json
-from tqdm import tqdm
-from typing import Dict, List, Optional, Union, Tuple
+from typing import Dict, List, Optional, Union
 
 import torch
 from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
 from pytorch_lightning import Trainer
-from nemo.collections.asr.parts.utils.audio_utils import ChannelSelectorType
 
 from nemo.collections.asr.data import audio_to_text_dataset
 from nemo.collections.asr.data.audio_to_text import _AudioTextDataset
 from nemo.collections.asr.data.audio_to_text_dali import AudioToBPEDALIDataset, DALIOutputs
 from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset
-from nemo.collections.asr.data.audio_to_text_lhotse_target_language import LhotseSpeechToTextBpeDatasetTgtLangID
+from nemo.collections.asr.data.audio_to_text_lhotse_target_language_debug import LhotseSpeechToTextBpeDatasetTgtLangIDDebug
 from nemo.collections.asr.losses.rnnt import RNNTLoss
 from nemo.collections.asr.metrics.wer import WER
 from nemo.collections.asr.metrics.bleu import BLEU
@@ -43,7 +39,7 @@ from nemo.core.neural_types import AudioSignal, LengthsType, NeuralType, Spectro
 
 #this is a copy of RNNT model on latest main 
 
-class EncDecRNNTBPEModelTgtLangID(EncDecRNNTBPEModel, ASRBPEMixin):
+class EncDecRNNTBPEModelTgtLangIDNorm(EncDecRNNTBPEModel, ASRBPEMixin):
     """Base class for encoder decoder RNNT-based models with subword tokenization."""
 
     @classmethod
@@ -380,9 +376,8 @@ class EncDecRNNTBPEModelTgtLangID(EncDecRNNTBPEModel, ASRBPEMixin):
 
     def _setup_dataloader_from_config(self, config: Optional[Dict]):
         if config.get("use_lhotse"):
-            # if 'initialize_target_lang_id_concatination' in self.cfg:
-            if config.get('initialize_target_lang_id_concatination', True):
-                dataset = LhotseSpeechToTextBpeDatasetTgtLangID(tokenizer=self.tokenizer, cfg=config)
+            if 'initialize_target_lang_id_concatination' in self.cfg:
+                dataset = LhotseSpeechToTextBpeDatasetTgtLangIDDebug(tokenizer=self.tokenizer, cfg=config)
             else:
                 dataset = LhotseSpeechToTextBpeDataset(tokenizer=self.tokenizer)
             return get_lhotse_dataloader_from_config(
@@ -655,6 +650,30 @@ class EncDecRNNTBPEModelTgtLangID(EncDecRNNTBPEModel, ASRBPEMixin):
         tensorboard_logs = {}
 
         # If experimental fused Joint-Loss-WER is not used
+        # if not self.joint.fuse_loss_wer:
+        #     if self.compute_eval_loss:
+        #         decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
+        #         joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
+
+        #         loss_value = self.loss(
+        #             log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
+        #         )
+
+        #         tensorboard_logs['val_loss'] = loss_value
+
+        #     self.wer.update(
+        #         predictions=encoded,
+        #         predictions_lengths=encoded_len,
+        #         targets=transcript,
+        #         targets_lengths=transcript_len,
+        #     )
+        #     wer, wer_num, wer_denom = self.wer.compute()
+        #     self.wer.reset()
+
+        #     tensorboard_logs['val_wer_num'] = wer_num
+        #     tensorboard_logs['val_wer_denom'] = wer_denom
+        #     tensorboard_logs['val_wer'] = wer
+
         if not self.joint.fuse_loss_wer:
             if self.compute_eval_loss:
                 decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
@@ -666,11 +685,22 @@ class EncDecRNNTBPEModelTgtLangID(EncDecRNNTBPEModel, ASRBPEMixin):
 
                 tensorboard_logs['val_loss'] = loss_value
 
+            # Get language indices from target_lang_id
+            lang_indices = torch.argmax(target_lang_id, dim=-1)  # B x T -> B
+            # Take first timestep since all timesteps should have same language
+            batch_lang_indices = lang_indices[:, 0]  # B
+            
+            # Convert indices back to language codes
+            reverse_lang_map = {v: k for k, v in self.dataset.language_to_index.items()}
+            batch_langs = [reverse_lang_map[idx.item()] for idx in batch_lang_indices]
+            
+            # Update WER with language info
             self.wer.update(
                 predictions=encoded,
                 predictions_lengths=encoded_len,
                 targets=transcript,
                 targets_lengths=transcript_len,
+                log_prefix=f"Source Lang: {batch_langs[0]} - ",  # Add language info to log prefix
             )
             wer, wer_num, wer_denom = self.wer.compute()
             self.wer.reset()
@@ -678,6 +708,7 @@ class EncDecRNNTBPEModelTgtLangID(EncDecRNNTBPEModel, ASRBPEMixin):
             tensorboard_logs['val_wer_num'] = wer_num
             tensorboard_logs['val_wer_denom'] = wer_denom
             tensorboard_logs['val_wer'] = wer
+            tensorboard_logs['target_lang'] = batch_langs[0]  # Log source language
 
         else:
             # If experimental fused Joint-Loss-WER is used
@@ -770,169 +801,6 @@ class EncDecRNNTBPEModelTgtLangID(EncDecRNNTBPEModel, ASRBPEMixin):
         metrics = {**val_loss_log, 'log': tensorboard_logs}
         
         return metrics
-    
-    def _setup_transcribe_dataloader(self, config: Dict) -> 'torch.utils.data.DataLoader':
-        """
-        Setup function for a temporary data loader which wraps the provided audio file.
-
-        Args:
-            config: A python dictionary which contains the following keys:
-            paths2audio_files: (a list) of paths to audio files. The files should be relatively short fragments. \
-                Recommended length per file is between 5 and 25 seconds.
-            batch_size: (int) batch size to use during inference. \
-                Bigger will result in better throughput performance but would use more memory.
-            temp_dir: (str) A temporary directory where the audio manifest is temporarily
-                stored.
-
-        Returns:
-            A pytorch DataLoader for the given audio file(s).
-        """
-        if 'manifest_filepath' in config:
-            print("'manifest_filepath' in config")
-            manifest_filepath = config['manifest_filepath']
-            batch_size = config['batch_size']
-        else:
-            manifest_filepath = os.path.join(config['temp_dir'], 'manifest.json')
-            # import pdb
-            # pdb.set_trace()
-            print(manifest_filepath)
-            batch_size = min(config['batch_size'], len(config['paths2audio_files']))
-
-        dl_config = {
-            'manifest_filepath': manifest_filepath,
-            'sample_rate': self.preprocessor._sample_rate,
-            'labels': self.joint.vocabulary,
-            'batch_size': batch_size,
-            'trim_silence': False,
-            'shuffle': False,
-            'num_workers': config.get('num_workers', min(batch_size, os.cpu_count() - 1)),
-            'pin_memory': True,
-            'use_lhotse': True,
-            'use_bucketing': False,
-            'drop_last': False,
-            'initialize_target_lang_id_concatination': True,
-        }
-
-        if config.get("augmentor"):
-            dl_config['augmentor'] = config.get("augmentor")
-
-
-        temporary_datalayer = self._setup_dataloader_from_config(config=DictConfig(dl_config))
-        return temporary_datalayer
-
-    @torch.no_grad()
-    def transcribe(
-        self,
-        manifest_filepath: str,
-        paths2audio_files: List[str],
-        batch_size: int = 4,
-        return_hypotheses: bool = False,
-        partial_hypothesis: Optional[List['Hypothesis']] = None,
-        num_workers: int = 0,
-        channel_selector: Optional[ChannelSelectorType] = None,
-        augmentor: DictConfig = None,
-        verbose: bool = True,
-    ) -> Tuple[List[str], Optional[List['Hypothesis']]]:
-        """
-        Uses greedy decoding to transcribe audio files. Use this method for debugging and prototyping.
-
-        Args:
-
-            paths2audio_files: (a list) of paths to audio files. \
-        Recommended length per file is between 5 and 25 seconds. \
-        But it is possible to pass a few hours long file if enough GPU memory is available.
-            batch_size: (int) batch size to use during inference. \
-        Bigger will result in better throughput performance but would use more memory.
-            return_hypotheses: (bool) Either return hypotheses or text
-        With hypotheses can do some postprocessing like getting timestamp or rescoring
-            num_workers: (int) number of workers for DataLoader
-            channel_selector (int | Iterable[int] | str): select a single channel or a subset of channels from multi-channel audio. If set to `'average'`, it performs averaging across channels. Disabled if set to `None`. Defaults to `None`. Uses zero-based indexing.
-            augmentor: (DictConfig): Augment audio samples during transcription if augmentor is applied.
-            verbose: (bool) whether to display tqdm progress bar
-        Returns:
-            Returns a tuple of 2 items -
-            * A list of greedy transcript texts / Hypothesis
-            * An optional list of beam search transcript texts / Hypothesis / NBestHypothesis.
-        """
-        if paths2audio_files is None or len(paths2audio_files) == 0:
-            return {}
-
-        # We will store transcriptions here
-        hypotheses = []
-        all_hypotheses = []
-        # Model's mode and device
-        mode = self.training
-        device = next(self.parameters()).device
-        dither_value = self.preprocessor.featurizer.dither
-        pad_to_value = self.preprocessor.featurizer.pad_to
-
-        if num_workers is None:
-            num_workers = min(batch_size, os.cpu_count() - 1)
-
-        try:
-            self.preprocessor.featurizer.dither = 0.0
-            self.preprocessor.featurizer.pad_to = 0
-
-            # Switch model to evaluation mode
-            self.eval()
-            # Freeze the encoder and decoder modules
-            self.encoder.freeze()
-            self.decoder.freeze()
-            self.joint.freeze()
-            logging_level = logging.get_verbosity()
-            logging.set_verbosity(logging.WARNING)
-            # Work in tmp directory - will store manifest file there
-            with tempfile.TemporaryDirectory() as tmpdir:
-                with open(os.path.join(tmpdir, 'manifest.json'), 'w', encoding='utf-8') as fp:
-                    for audio_file in paths2audio_files:
-                        entry = {'audio_filepath': audio_file, 'duration': 100000, 'text': ''}
-                        fp.write(json.dumps(entry) + '\n')
-
-                config = {
-                    'manifest_filepath': manifest_filepath,
-                    'paths2audio_files': paths2audio_files,
-                    'batch_size': batch_size,
-                    'temp_dir': tmpdir,
-                    'num_workers': num_workers,
-                    'channel_selector': channel_selector,
-                }
-
-                if augmentor:
-                    config['augmentor'] = augmentor
-
-                temporary_datalayer = self._setup_transcribe_dataloader(config)
-
-                for test_batch in tqdm(temporary_datalayer, desc="Transcribing", disable=(not verbose)):
-                    encoded, encoded_len = self.forward(
-                        input_signal=test_batch[0].to(device), input_signal_length=test_batch[1].to(device), target_lang_id=test_batch[4].to(device)
-                    )
-                    best_hyp, all_hyp = self.decoding.rnnt_decoder_predictions_tensor(
-                        encoded,
-                        encoded_len,
-                        return_hypotheses=return_hypotheses,
-                        partial_hypotheses=partial_hypothesis,
-                    )
-
-                    hypotheses += best_hyp
-                    if all_hyp is not None:
-                        all_hypotheses += all_hyp
-                    else:
-                        all_hypotheses += best_hyp
-
-                    del encoded
-                    del test_batch
-        finally:
-            # set mode back to its original value
-            self.train(mode=mode)
-            self.preprocessor.featurizer.dither = dither_value
-            self.preprocessor.featurizer.pad_to = pad_to_value
-
-            logging.set_verbosity(logging_level)
-            if mode is True:
-                self.encoder.unfreeze()
-                self.decoder.unfreeze()
-                self.joint.unfreeze()
-        return hypotheses, all_hypotheses
 
     @property
     def bleu(self):

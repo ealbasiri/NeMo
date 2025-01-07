@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo.collections.asr.models.aed_multitask_models import EncDecMultiTaskModel
+# from nemo.collections.asr.models.aed_multitask_models import EncDecMultiTaskModel
 from nemo.collections.asr.models.asr_model import ASRModel
 from nemo.collections.asr.models.audio_to_audio_model import AudioToAudioModel
 from nemo.collections.asr.models.classification_models import EncDecClassificationModel, EncDecFrameClassificationModel
@@ -32,6 +32,7 @@ from nemo.collections.asr.models.label_models import EncDecSpeakerLabelModel
 from nemo.collections.asr.models.msdd_models import EncDecDiarLabelModel, NeuralDiarizer
 from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
 from nemo.collections.asr.models.rnnt_bpe_models_tgt_lang import EncDecRNNTBPEModelTgtLangID
+from nemo.collections.asr.models.rnnt_bpe_models_tgt_lang_norm import EncDecRNNTBPEModelTgtLangIDNorm
 from nemo.collections.asr.models.rnnt_models import EncDecRNNTModel
 from nemo.collections.asr.models.slu_models import SLUIntentSlotBPEModel
 from nemo.collections.asr.models.ssl_models import SpeechEncDecSelfSupervisedModel

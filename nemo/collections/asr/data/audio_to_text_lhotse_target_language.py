@@ -15,7 +15,60 @@ class LhotseSpeechToTextBpeDatasetTgtLangID(torch.utils.data.Dataset):
     """
     Dataset class for speech-to-text with language ID vectors.
     """
-    
+    _GLOBAL_LANG_MAP = {
+    # Group 1: 
+    'en-US': 0,   'en-GB': 1,   
+    'es-ES': 2,   'es-US': 3,   # Spanish variants
+    'zh-CN': 4,   'zh-TW': 5,   # Chinese variants
+    'hi-IN': 6,   'ar-AR': 7,   # Hindi & Arabic
+    'fr-FR': 8,   'de-DE': 9,   # French & German
+    'ja-JP': 10,  'ru-RU': 11,  # Japanese & Russian
+    'pt-BR': 12,  'pt-PT': 13,  # Portuguese variants
+    'ko-KR': 14,  'it-IT': 15,  # Korean & Italian
+
+    # Group 2: 
+    'nl-NL': 16,  'pl-PL': 17,  
+    'tr-TR': 18,  'uk-UA': 19,
+    'ro-RO': 20,  'el-GR': 21,
+    'cs-CZ': 22,  'hu-HU': 23,
+    'sv-SE': 24,  'da-DK': 25,
+    'fi-FI': 26,  'no-NO': 27,
+    'sk-SK': 28,  'hr-HR': 29,
+    'bg-BG': 30,  'lt-LT': 31,
+
+    # Group 3: 
+    'th-TH': 32,  'vi-VN': 33,
+    'id-ID': 34,  'ms-MY': 35,
+    'bn-IN': 36,  'ur-PK': 37,
+    'fa-IR': 38,  'ta-IN': 39,
+    'te-IN': 40,  'mr-IN': 41,
+    'gu-IN': 42,  'kn-IN': 43,
+    'ml-IN': 44,  'si-LK': 45,
+    'ne-NP': 46,  'km-KH': 47,
+
+    # Group 4: 
+    'sw-KE': 48,  'am-ET': 49,
+    'ha-NG': 50,  'zu-ZA': 51,
+    'yo-NG': 52,  'ig-NG': 53,
+    'af-ZA': 54,  'rw-RW': 55,
+    'so-SO': 56,  'ny-MW': 57,
+    'ln-CD': 58,  'or-KE': 59,
+
+
+    # Group 5: 
+    'he-IL': 64,  'ku-TR': 65,
+    'az-AZ': 66,  'ka-GE': 67,
+    'hy-AM': 68,  'uz-UZ': 69,
+    'tg-TJ': 70,  'ky-KG': 71,
+
+    'qu-PE': 80,  'ay-BO': 81,
+    'gn-PY': 82,  'nah-MX': 83,
+
+
+    # Group 7: 
+    'mi-NZ': 96,  'haw-US': 97,
+    'sm-WS': 98,  'to-TO': 99}
+
     @property
     def output_types(self) -> Optional[Dict[str, NeuralType]]:
         return {
@@ -37,21 +90,28 @@ class LhotseSpeechToTextBpeDatasetTgtLangID(torch.utils.data.Dataset):
         self.num_mel_frame_per_asr_frame = cfg.get('num_mel_frame_per_asr_frame', 8)
     
         # Track unique languages seen during training
-        self.seen_languages = set()
-        self.language_to_index = {}
-        self.next_lang_idx = 0
+        # self.seen_languages = set()
+        # self.language_to_index = {}
+        # self.next_lang_idx = 0
 
     def _get_language_index(self, language_code: str) -> int:
         """
-        Maps language codes to indices dynamically.
+        Maps language codes to indices .
         """
-        if language_code not in self.language_to_index:
-            if self.next_lang_idx >= self.num_languages:
-                raise ValueError(f"Number of unique languages ({self.next_lang_idx + 1}) exceeds maximum allowed ({self.num_languages})")
-            self.language_to_index[language_code] = self.next_lang_idx
-            self.next_lang_idx += 1
-            self.seen_languages.add(language_code)
-        return self.language_to_index[language_code]
+        if language_code not in self._GLOBAL_LANG_MAP:
+            raise ValueError(f"Unknown language code: {language_code}. Supported languages: {list(self._GLOBAL_LANG_MAP.keys())}")
+        
+        index = self._GLOBAL_LANG_MAP[language_code]
+        
+        return index
+        
+        # if language_code not in self.language_to_index:
+        #     if self.next_lang_idx >= self.num_languages:
+        #         raise ValueError(f"Number of unique languages ({self.next_lang_idx + 1}) exceeds maximum allowed ({self.num_languages})")
+        #     self.language_to_index[language_code] = self.next_lang_idx
+        #     self.next_lang_idx += 1
+        #     self.seen_languages.add(language_code)
+        # return self.language_to_index[language_code]
 
     def lang_to_target_lang(self, cut, num_languages: int, num_sample_per_mel_frame: int, num_mel_frame_per_asr_frame: int):
         """
