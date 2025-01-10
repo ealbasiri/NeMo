@@ -11,18 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import traceback
 import copy
 import os
-import tempfile
-import json
-from tqdm import tqdm
-from typing import Dict, List, Optional, Union, Tuple
+from typing import Dict, List, Optional, Union
 
 import torch
 from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
 from pytorch_lightning import Trainer
-# from nemo.collections.asr.parts.utils.audio_utils import ChannelSelectorType
 
 from nemo.collections.asr.data import audio_to_text_dataset
 from nemo.collections.asr.data.audio_to_text import _AudioTextDataset
@@ -322,7 +318,7 @@ class EncDecRNNTBPEModelTgtLangIDDebug(EncDecRNNTBPEModel, ASRBPEMixin):
 
         super().__init__(cfg=cfg, trainer=trainer)
         
-        if cfg.get("initialize_target_lang_id_concatination", True):
+        if cfg.get("initialize_target_lang_id_concatination", False):
             self.initialize_target_lang_id_concatination()
 
     def initialize_target_lang_id_concatination(self):
@@ -350,7 +346,8 @@ class EncDecRNNTBPEModelTgtLangIDDebug(EncDecRNNTBPEModel, ASRBPEMixin):
         self.bleu = BLEU(
             decoding=self.decoding,
             tokenize=self.cfg.get('bleu_tokenizer', "13a"),
-            log_prediction=True
+            log_prediction=True,
+            dist_sync_on_step=True,
         )
 
         # Setup fused Joint step if flag is set
@@ -362,11 +359,12 @@ class EncDecRNNTBPEModelTgtLangIDDebug(EncDecRNNTBPEModel, ASRBPEMixin):
             self.concat = True
             self.num_langs = self._cfg.model_defaults.get('num_langs', 128)
             
-            # Setup normalization ln, l2, or None
-            self.norm = self._cfg.model_defaults.get('norm', None)
-            if self.norm == 'ln':
+            # Setup normalization
+            self.norm = self._cfg.get('norm', None)
+            if self._cfg.get('norm') == 'ln':
                 self.asr_norm = torch.nn.LayerNorm(self._cfg.model_defaults.enc_hidden)
                 self.lang_norm = torch.nn.LayerNorm(self.num_langs)
+
 
             # Setup projection layers
             proj_in_size = self.num_langs + self._cfg.model_defaults.enc_hidden
@@ -378,10 +376,14 @@ class EncDecRNNTBPEModelTgtLangIDDebug(EncDecRNNTBPEModel, ASRBPEMixin):
                 torch.nn.Linear(proj_out_size * 2, proj_out_size)
             )
 
+
+            # For later application
+            # if self.lang_kernel_type == 'sinusoidal':
+            #     self.lang_kernel = self.get_sinusoid_position_encoding(self.num_langs, cfg.model_defaults.enc_hidden)              
+
     def _setup_dataloader_from_config(self, config: Optional[Dict]):
         if config.get("use_lhotse"):
-            # if 'initialize_target_lang_id_concatination' in self.cfg:
-            if config.get('initialize_target_lang_id_concatination', True):
+            if 'initialize_target_lang_id_concatination' in self.cfg:
                 dataset = LhotseSpeechToTextBpeDatasetTgtLangID(tokenizer=self.tokenizer, cfg=config)
             else:
                 dataset = LhotseSpeechToTextBpeDataset(tokenizer=self.tokenizer)
@@ -510,14 +512,6 @@ class EncDecRNNTBPEModelTgtLangIDDebug(EncDecRNNTBPEModel, ASRBPEMixin):
             if target_lang_id.shape[1] > encoded.shape[1]:
                 target_lang_id = target_lang_id[:, :encoded.shape[1], :]
 
-            # Normalize the features
-            if self.norm == 'ln':
-                target_lang_id = self.lang_norm(target_lang_id)  # Layer norm for language predictions
-                encoded = self.asr_norm(encoded)  # Layer norm for ASR encodings
-            elif self.norm == 'l2':
-                target_lang_id = torch.nn.functional.normalize(target_lang_id, p=2, dim=-1)
-                encoded = torch.nn.functional.normalize(encoded, p=2, dim=-1)
-
             # Concatenate encoded states with language ID
             concat_enc_states = torch.cat([encoded, target_lang_id], dim=-1)
         
@@ -642,92 +636,265 @@ class EncDecRNNTBPEModelTgtLangIDDebug(EncDecRNNTBPEModel, ASRBPEMixin):
         sample_id = sample_id.cpu().detach().numpy()
         return list(zip(sample_id, best_hyp_text))
 
+    # def validation_pass(self, batch, batch_idx, dataloader_idx=0):
+
+    #     signal, signal_len, transcript, transcript_len, target_lang_id = batch
+
+    #     # forward() only performs encoder forward
+    #     if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
+    #         encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
+    #     else:
+    #         encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, target_lang_id=target_lang_id)
+    #     del signal
+
+    #     tensorboard_logs = {}
+
+    #     # If experimental fused Joint-Loss-WER is not used
+    #     if not self.joint.fuse_loss_wer:
+    #         if self.compute_eval_loss:
+    #             decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
+    #             joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
+
+    #             loss_value = self.loss(
+    #                 log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
+    #             )
+
+    #             tensorboard_logs['val_loss'] = loss_value
+
+    #         self.wer.update(
+    #             predictions=encoded,
+    #             predictions_lengths=encoded_len,
+    #             targets=transcript,
+    #             targets_lengths=transcript_len,
+    #         )
+    #         wer, wer_num, wer_denom = self.wer.compute()
+    #         self.wer.reset()
+
+    #         tensorboard_logs['val_wer_num'] = wer_num
+    #         tensorboard_logs['val_wer_denom'] = wer_denom
+    #         tensorboard_logs['val_wer'] = wer
+
+    #     else:
+    #         # If experimental fused Joint-Loss-WER is used
+    #         compute_wer = True
+
+    #         if self.compute_eval_loss:
+    #             decoded, target_len, states = self.decoder(targets=transcript, target_length=transcript_len)
+    #         else:
+    #             decoded = None
+    #             target_len = transcript_len
+
+    #         # Fused joint step
+    #         loss_value, wer, wer_num, wer_denom = self.joint(
+    #             encoder_outputs=encoded,
+    #             decoder_outputs=decoded,
+    #             encoder_lengths=encoded_len,
+    #             transcripts=transcript,
+    #             transcript_lengths=target_len,
+    #             compute_wer=compute_wer,
+    #         )
+
+    #         if loss_value is not None:
+    #             tensorboard_logs['val_loss'] = loss_value
+
+    #         tensorboard_logs['val_wer_num'] = wer_num
+    #         tensorboard_logs['val_wer_denom'] = wer_denom
+    #         tensorboard_logs['val_wer'] = wer
+
+    #     # BLEU score calculation
+    #     self.bleu.update(
+    #         predictions=encoded,
+    #         predictions_lengths=encoded_len,
+    #         targets=transcript,
+    #         targets_lengths=transcript_len
+    #     )
+    #     #here is the distributed 
+    #     bleu_metrics = self.bleu.compute(return_all_metrics=True, prefix="val_")
+
+    #     tensorboard_logs.update({
+    #         'val_bleu_num': bleu_metrics['val_bleu_num'],
+    #         'val_bleu_denom': bleu_metrics['val_bleu_denom'],
+    #         'val_bleu_pred_len': bleu_metrics['val_bleu_pred_len'],
+    #         'val_bleu_target_len': bleu_metrics['val_bleu_target_len'],
+    #         'val_bleu': bleu_metrics['val_bleu']
+    #     })
+    #     self.bleu.reset()
+
+    #     self.log('global_step', torch.tensor(self.trainer.global_step, dtype=torch.float32))
+
+    #     return tensorboard_logs
+
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
-        signal, signal_len, transcript, transcript_len, target_lang_id = batch
+        """Validation step - calculate metrics with distributed computation."""
+        try:
+            print(f"GPU {self.global_rank} starting validation - batch_idx: {batch_idx}")
+            
+            # Unpack batch and clear GPU memory where possible
+            signal, signal_len, transcript, transcript_len, target_lang_id = batch
+            print(f"GPU {self.global_rank} batch shapes:", {
+                "signal": signal.shape,
+                "signal_len": signal_len.shape,
+                "transcript": transcript.shape,
+                "transcript_len": transcript_len.shape,
+                "target_lang_id": target_lang_id.shape
+            })
 
-        # forward() only performs encoder forward
-        if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
-            encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
-        else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, target_lang_id=target_lang_id)
-        del signal
-
-        tensorboard_logs = {}
-
-        # If experimental fused Joint-Loss-WER is not used
-        if not self.joint.fuse_loss_wer:
-            if self.compute_eval_loss:
-                decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
-                joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
-
-                loss_value = self.loss(
-                    log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
-                )
-
-                tensorboard_logs['val_loss'] = loss_value
-
-            self.wer.update(
-                predictions=encoded,
-                predictions_lengths=encoded_len,
-                targets=transcript,
-                targets_lengths=transcript_len,
-            )
-            wer, wer_num, wer_denom = self.wer.compute()
-            self.wer.reset()
-
-            tensorboard_logs['val_wer_num'] = wer_num
-            tensorboard_logs['val_wer_denom'] = wer_denom
-            tensorboard_logs['val_wer'] = wer
-
-        else:
-            # If experimental fused Joint-Loss-WER is used
-            compute_wer = True
-
-            if self.compute_eval_loss:
-                decoded, target_len, states = self.decoder(targets=transcript, target_length=transcript_len)
+            # Debug memory before forward pass
+            print(f"GPU {self.global_rank} - Memory before forward pass: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+            
+            # Forward pass
+            if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
+                print(f"GPU {self.global_rank} - Using processed signal")
+                encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
             else:
-                decoded = None
-                target_len = transcript_len
+                print(f"GPU {self.global_rank} - Using raw signal")
+                encoded, encoded_len = self.forward(
+                    input_signal=signal,
+                    input_signal_length=signal_len,
+                    target_lang_id=target_lang_id
+                )
+            
+            print(f"GPU {self.global_rank} encoded shape: {encoded.shape}, encoded_len: {encoded_len.shape}")
+            print(f"GPU {self.global_rank} - Memory after forward pass: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+            del signal
 
-            # Fused joint step
-            loss_value, wer, wer_num, wer_denom = self.joint(
-                encoder_outputs=encoded,
-                decoder_outputs=decoded,
-                encoder_lengths=encoded_len,
-                transcripts=transcript,
-                transcript_lengths=target_len,
-                compute_wer=compute_wer,
-            )
+            # Calculate metrics
+            if not self.joint.fuse_loss_wer:
+                print(f"GPU {self.global_rank} - Using non-fused loss calculation")
+                if self.compute_eval_loss:
+                    decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
+                    joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
+                    loss_value = self.loss(
+                        log_probs=joint,
+                        targets=transcript,
+                        input_lengths=encoded_len,
+                        target_lengths=target_length
+                    )
+                    self.log('val_loss', loss_value, sync_dist=True)
+                    
+                # Compute WER
+                self.wer.update(
+                    predictions=encoded,
+                    predictions_lengths=encoded_len,
+                    targets=transcript,
+                    targets_lengths=transcript_len,
+                )
+                wer, wer_num, wer_denom = self.wer.compute()
+                self.wer.reset()
+                
+                # Log WER metrics
+                self.log('val_wer', wer, sync_dist=True)
+                self.log('val_wer_num', wer_num, sync_dist=True)
+                self.log('val_wer_denom', wer_denom, sync_dist=True)
+            else:
+                print(f"GPU {self.global_rank} - Starting fused loss calculation")
+                # Debug sync point
+                torch.distributed.barrier()
+                print(f"GPU {self.global_rank} - All GPUs synchronized before fused calculation")
+                
+                compute_wer = True
+                if self.compute_eval_loss:
+                    print(f"GPU {self.global_rank} - Computing decoder outputs")
+                    decoded, target_len, states = self.decoder(targets=transcript, target_length=transcript_len)
+                    print(f"GPU {self.global_rank} - Decoder output shapes:",
+                        f"decoded: {decoded.shape}, target_len: {target_len.shape}")
+                else:
+                    decoded = None
+                    target_len = transcript_len
+                    print(f"GPU {self.global_rank} - Skipping decoder, using transcript_len directly")
 
-            if loss_value is not None:
-                tensorboard_logs['val_loss'] = loss_value
+                print(f"GPU {self.global_rank} - Memory before joint calculation: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+                print(f"GPU {self.global_rank} - Joint calculation tensor stats:",
+                    f"\nencoder_outputs min/max: {encoded.min().item():.3f}/{encoded.max().item():.3f}",
+                    f"\nencoder_lengths unique values: {encoded_len.unique().tolist()}",
+                    f"\ntranscript_lengths unique values: {target_len.unique().tolist()}")
 
-            tensorboard_logs['val_wer_num'] = wer_num
-            tensorboard_logs['val_wer_denom'] = wer_denom
-            tensorboard_logs['val_wer'] = wer
+                # Before joint call:
+                torch.cuda.synchronize()  # Ensure previous operations are complete
+                print(f"GPU {self.global_rank} - Pre-joint CUDA memory: {torch.cuda.memory_allocated()/1e9:.2f}GB")
 
-        # Maybe add a condition to cal BLEU 
-        # BLEU score calculation
-        self.bleu.update(
-            predictions=encoded,
-            predictions_lengths=encoded_len,
-            targets=transcript,
-            targets_lengths=transcript_len
-        )
-        bleu_metrics = self.bleu.compute(return_all_metrics=True, prefix="val_")
-        tensorboard_logs.update({
-            'val_bleu_num': bleu_metrics['val_bleu_num'],
-            'val_bleu_denom': bleu_metrics['val_bleu_denom'],
-            'val_bleu_pred_len': bleu_metrics['val_bleu_pred_len'],
-            'val_bleu_target_len': bleu_metrics['val_bleu_target_len'],
-            'val_bleu': bleu_metrics['val_bleu']
-        })
-        self.bleu.reset()
+                # Calculate fused metrics
+                try:
+                    print(f"GPU {self.global_rank} - Starting joint calculation")
+                    loss_value, wer, wer_num, wer_denom = self.joint(
+                        encoder_outputs=encoded,
+                        decoder_outputs=decoded,
+                        encoder_lengths=encoded_len,
+                        transcripts=transcript,
+                        transcript_lengths=target_len,
+                        compute_wer=compute_wer,
+                    )
+                    print(f"GPU {self.global_rank} - Completed joint calculation")
+                except Exception as e:
+                    print(f"GPU {self.global_rank} - Exception in joint calculation: {str(e)}")
+                    print(f"GPU {self.global_rank} - Input shapes to joint:",
+                        f"\nencoder_outputs: {encoded.shape}",
+                        f"\ndecoder_outputs: {None if decoded is None else decoded.shape}",
+                        f"\nencoder_lengths: {encoded_len.shape}",
+                        f"\ntranscripts: {transcript.shape}",
+                        f"\ntranscript_lengths: {target_len.shape}")
+                    raise
 
-        self.log('global_step', torch.tensor(self.trainer.global_step, dtype=torch.float32))
+                # Debug sync point
+                torch.distributed.barrier()
+                print(f"GPU {self.global_rank} - All GPUs synchronized after joint calculation")
 
-        return tensorboard_logs
+                if loss_value is not None:
+                    print(f"GPU {self.global_rank} - Logging val_loss: {loss_value.item()}")
+                    self.log('val_loss', loss_value, sync_dist=True)
+                
+                # Log WER metrics
+                print(f"GPU {self.global_rank} - Logging WER metrics: {wer}")
+                self.log('val_wer', wer, sync_dist=True)
+                self.log('val_wer_num', wer_num, sync_dist=True)
+                self.log('val_wer_denom', wer_denom, sync_dist=True)
 
+                print(f"GPU {self.global_rank} - Completed WER validation_pass for batch {batch_idx}")
+                # BLEU score calculation
+                print(f"GPU {self.global_rank} starting BLEU computation")
+                try:
+                    # Reset metric state
+                    self.bleu.reset()
+                    
+                    # Synchronize before metric computation
+                    torch.cuda.synchronize()
+                    
+                    # Update BLEU state with current batch
+                    self.bleu.update(
+                        predictions=encoded,
+                        predictions_lengths=encoded_len,
+                        targets=transcript,
+                        targets_lengths=transcript_len
+                    )
+                    
+                    # Synchronize before computing final values
+                    torch.cuda.synchronize()
+                    
+                    # Compute and log all BLEU metrics
+                    bleu_metrics = self.bleu.compute(return_all_metrics=True, prefix="val_")
+                    for k, v in bleu_metrics.items():
+                        self.log('val_bleu_num', v.mean(), sync_dist=True)
+
+                    # self.log(k, v, sync_dist=True)
+                    
+                    print(f"GPU {self.global_rank} BLEU score: {bleu_metrics['val_bleu']}")
+
+                except Exception as e:
+                    print(f"GPU {self.global_rank} BLEU computation failed: {str(e)}")
+                    print(f"GPU {self.global_rank} traceback: {traceback.format_exc()}")
+                    self.bleu.reset()
+                    raise
+
+                # Log global step
+                self.log('global_step', torch.tensor(self.trainer.global_step, dtype=torch.float32), sync_dist=True)
+                
+                print(f"GPU {self.global_rank} validation complete")
+                return {}
+
+        except Exception as e:
+            print(f"GPU {self.global_rank} validation failed with error: {str(e)}")
+            print(f"GPU {self.global_rank} traceback: {traceback.format_exc()}")
+            raise
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         metrics = self.validation_pass(batch, batch_idx, dataloader_idx)
         if type(self.trainer.val_dataloaders) == list and len(self.trainer.val_dataloaders) > 1:
@@ -770,169 +937,6 @@ class EncDecRNNTBPEModelTgtLangIDDebug(EncDecRNNTBPEModel, ASRBPEMixin):
         metrics = {**val_loss_log, 'log': tensorboard_logs}
         
         return metrics
-    
-    def _setup_transcribe_dataloader(self, config: Dict) -> 'torch.utils.data.DataLoader':
-        """
-        Setup function for a temporary data loader which wraps the provided audio file.
-
-        Args:
-            config: A python dictionary which contains the following keys:
-            paths2audio_files: (a list) of paths to audio files. The files should be relatively short fragments. \
-                Recommended length per file is between 5 and 25 seconds.
-            batch_size: (int) batch size to use during inference. \
-                Bigger will result in better throughput performance but would use more memory.
-            temp_dir: (str) A temporary directory where the audio manifest is temporarily
-                stored.
-
-        Returns:
-            A pytorch DataLoader for the given audio file(s).
-        """
-        if 'manifest_filepath' in config:
-            print("'manifest_filepath' in config")
-            manifest_filepath = config['manifest_filepath']
-            batch_size = config['batch_size']
-        else:
-            manifest_filepath = os.path.join(config['temp_dir'], 'manifest.json')
-            # import pdb
-            # pdb.set_trace()
-            print(manifest_filepath)
-            batch_size = min(config['batch_size'], len(config['paths2audio_files']))
-
-        dl_config = {
-            'manifest_filepath': manifest_filepath,
-            'sample_rate': self.preprocessor._sample_rate,
-            'labels': self.joint.vocabulary,
-            'batch_size': batch_size,
-            'trim_silence': False,
-            'shuffle': False,
-            'num_workers': config.get('num_workers', min(batch_size, os.cpu_count() - 1)),
-            'pin_memory': True,
-            'use_lhotse': True,
-            'use_bucketing': False,
-            'drop_last': False,
-            'initialize_target_lang_id_concatination': True,
-        }
-
-        if config.get("augmentor"):
-            dl_config['augmentor'] = config.get("augmentor")
-
-
-        temporary_datalayer = self._setup_dataloader_from_config(config=DictConfig(dl_config))
-        return temporary_datalayer
-
-    @torch.no_grad()
-    def transcribe(
-        self,
-        manifest_filepath: str,
-        paths2audio_files: List[str],
-        batch_size: int = 4,
-        return_hypotheses: bool = False,
-        partial_hypothesis: Optional[List['Hypothesis']] = None,
-        num_workers: int = 0,
-        # channel_selector: Optional[ChannelSelectorType] = None,
-        augmentor: DictConfig = None,
-        verbose: bool = True,
-    ) -> Tuple[List[str], Optional[List['Hypothesis']]]:
-        """
-        Uses greedy decoding to transcribe audio files. Use this method for debugging and prototyping.
-
-        Args:
-
-            paths2audio_files: (a list) of paths to audio files. \
-        Recommended length per file is between 5 and 25 seconds. \
-        But it is possible to pass a few hours long file if enough GPU memory is available.
-            batch_size: (int) batch size to use during inference. \
-        Bigger will result in better throughput performance but would use more memory.
-            return_hypotheses: (bool) Either return hypotheses or text
-        With hypotheses can do some postprocessing like getting timestamp or rescoring
-            num_workers: (int) number of workers for DataLoader
-            channel_selector (int | Iterable[int] | str): select a single channel or a subset of channels from multi-channel audio. If set to `'average'`, it performs averaging across channels. Disabled if set to `None`. Defaults to `None`. Uses zero-based indexing.
-            augmentor: (DictConfig): Augment audio samples during transcription if augmentor is applied.
-            verbose: (bool) whether to display tqdm progress bar
-        Returns:
-            Returns a tuple of 2 items -
-            * A list of greedy transcript texts / Hypothesis
-            * An optional list of beam search transcript texts / Hypothesis / NBestHypothesis.
-        """
-        if paths2audio_files is None or len(paths2audio_files) == 0:
-            return {}
-
-        # We will store transcriptions here
-        hypotheses = []
-        all_hypotheses = []
-        # Model's mode and device
-        mode = self.training
-        device = next(self.parameters()).device
-        dither_value = self.preprocessor.featurizer.dither
-        pad_to_value = self.preprocessor.featurizer.pad_to
-
-        if num_workers is None:
-            num_workers = min(batch_size, os.cpu_count() - 1)
-
-        try:
-            self.preprocessor.featurizer.dither = 0.0
-            self.preprocessor.featurizer.pad_to = 0
-
-            # Switch model to evaluation mode
-            self.eval()
-            # Freeze the encoder and decoder modules
-            self.encoder.freeze()
-            self.decoder.freeze()
-            self.joint.freeze()
-            logging_level = logging.get_verbosity()
-            logging.set_verbosity(logging.WARNING)
-            # Work in tmp directory - will store manifest file there
-            with tempfile.TemporaryDirectory() as tmpdir:
-                with open(os.path.join(tmpdir, 'manifest.json'), 'w', encoding='utf-8') as fp:
-                    for audio_file in paths2audio_files:
-                        entry = {'audio_filepath': audio_file, 'duration': 100000, 'text': ''}
-                        fp.write(json.dumps(entry) + '\n')
-
-                config = {
-                    'manifest_filepath': manifest_filepath,
-                    'paths2audio_files': paths2audio_files,
-                    'batch_size': batch_size,
-                    'temp_dir': tmpdir,
-                    'num_workers': num_workers,
-                    'channel_selector': channel_selector,
-                }
-
-                if augmentor:
-                    config['augmentor'] = augmentor
-
-                temporary_datalayer = self._setup_transcribe_dataloader(config)
-
-                for test_batch in tqdm(temporary_datalayer, desc="Transcribing", disable=(not verbose)):
-                    encoded, encoded_len = self.forward(
-                        input_signal=test_batch[0].to(device), input_signal_length=test_batch[1].to(device), target_lang_id=test_batch[4].to(device)
-                    )
-                    best_hyp, all_hyp = self.decoding.rnnt_decoder_predictions_tensor(
-                        encoded,
-                        encoded_len,
-                        return_hypotheses=return_hypotheses,
-                        partial_hypotheses=partial_hypothesis,
-                    )
-
-                    hypotheses += best_hyp
-                    if all_hyp is not None:
-                        all_hypotheses += all_hyp
-                    else:
-                        all_hypotheses += best_hyp
-
-                    del encoded
-                    del test_batch
-        finally:
-            # set mode back to its original value
-            self.train(mode=mode)
-            self.preprocessor.featurizer.dither = dither_value
-            self.preprocessor.featurizer.pad_to = pad_to_value
-
-            logging.set_verbosity(logging_level)
-            if mode is True:
-                self.encoder.unfreeze()
-                self.decoder.unfreeze()
-                self.joint.unfreeze()
-        return hypotheses, all_hypotheses
 
     @property
     def bleu(self):

@@ -11,10 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import traceback
 import copy
 import os
-from typing import Dict, List, Optional, Union
+import tempfile
+import json
+from tqdm import tqdm
+from typing import Dict, List, Optional, Union, Tuple
 
 import torch
 from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
@@ -765,6 +767,168 @@ class EncDecRNNTBPEModelTgtLangID(EncDecRNNTBPEModel, ASRBPEMixin):
         metrics = {**val_loss_log, 'log': tensorboard_logs}
         
         return metrics
+    def _setup_transcribe_dataloader(self, config: Dict) -> 'torch.utils.data.DataLoader':
+        """
+        Setup function for a temporary data loader which wraps the provided audio file.
+
+        Args:
+            config: A python dictionary which contains the following keys:
+            paths2audio_files: (a list) of paths to audio files. The files should be relatively short fragments. \
+                Recommended length per file is between 5 and 25 seconds.
+            batch_size: (int) batch size to use during inference. \
+                Bigger will result in better throughput performance but would use more memory.
+            temp_dir: (str) A temporary directory where the audio manifest is temporarily
+                stored.
+
+        Returns:
+            A pytorch DataLoader for the given audio file(s).
+        """
+        if 'manifest_filepath' in config:
+            print("'manifest_filepath' in config")
+            manifest_filepath = config['manifest_filepath']
+            batch_size = config['batch_size']
+        else:
+            manifest_filepath = os.path.join(config['temp_dir'], 'manifest.json')
+            # import pdb
+            # pdb.set_trace()
+            print(manifest_filepath)
+            batch_size = min(config['batch_size'], len(config['paths2audio_files']))
+
+        dl_config = {
+            'manifest_filepath': manifest_filepath,
+            'sample_rate': self.preprocessor._sample_rate,
+            'labels': self.joint.vocabulary,
+            'batch_size': batch_size,
+            'trim_silence': False,
+            'shuffle': False,
+            'num_workers': config.get('num_workers', min(batch_size, os.cpu_count() - 1)),
+            'pin_memory': True,
+            'use_lhotse': True,
+            'use_bucketing': False,
+            'drop_last': False,
+            'initialize_target_lang_id_concatination': True,
+        }
+
+        if config.get("augmentor"):
+            dl_config['augmentor'] = config.get("augmentor")
+
+
+        temporary_datalayer = self._setup_dataloader_from_config(config=DictConfig(dl_config))
+        return temporary_datalayer
+
+    @torch.no_grad()
+    def transcribe(
+        self,
+        manifest_filepath: str,
+        paths2audio_files: List[str],
+        batch_size: int = 4,
+        return_hypotheses: bool = False,
+        partial_hypothesis: Optional[List['Hypothesis']] = None,
+        num_workers: int = 0,
+        # channel_selector: Optional[ChannelSelectorType] = None,
+        augmentor: DictConfig = None,
+        verbose: bool = True,
+    ) -> Tuple[List[str], Optional[List['Hypothesis']]]:
+        """
+        Uses greedy decoding to transcribe audio files. Use this method for debugging and prototyping.
+
+        Args:
+
+            paths2audio_files: (a list) of paths to audio files. \
+        Recommended length per file is between 5 and 25 seconds. \
+        But it is possible to pass a few hours long file if enough GPU memory is available.
+            batch_size: (int) batch size to use during inference. \
+        Bigger will result in better throughput performance but would use more memory.
+            return_hypotheses: (bool) Either return hypotheses or text
+        With hypotheses can do some postprocessing like getting timestamp or rescoring
+            num_workers: (int) number of workers for DataLoader
+            channel_selector (int | Iterable[int] | str): select a single channel or a subset of channels from multi-channel audio. If set to `'average'`, it performs averaging across channels. Disabled if set to `None`. Defaults to `None`. Uses zero-based indexing.
+            augmentor: (DictConfig): Augment audio samples during transcription if augmentor is applied.
+            verbose: (bool) whether to display tqdm progress bar
+        Returns:
+            Returns a tuple of 2 items -
+            * A list of greedy transcript texts / Hypothesis
+            * An optional list of beam search transcript texts / Hypothesis / NBestHypothesis.
+        """
+        if paths2audio_files is None or len(paths2audio_files) == 0:
+            return {}
+
+        # We will store transcriptions here
+        hypotheses = []
+        all_hypotheses = []
+        # Model's mode and device
+        mode = self.training
+        device = next(self.parameters()).device
+        dither_value = self.preprocessor.featurizer.dither
+        pad_to_value = self.preprocessor.featurizer.pad_to
+
+        if num_workers is None:
+            num_workers = min(batch_size, os.cpu_count() - 1)
+
+        try:
+            self.preprocessor.featurizer.dither = 0.0
+            self.preprocessor.featurizer.pad_to = 0
+
+            # Switch model to evaluation mode
+            self.eval()
+            # Freeze the encoder and decoder modules
+            self.encoder.freeze()
+            self.decoder.freeze()
+            self.joint.freeze()
+            logging_level = logging.get_verbosity()
+            logging.set_verbosity(logging.WARNING)
+            # Work in tmp directory - will store manifest file there
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with open(os.path.join(tmpdir, 'manifest.json'), 'w', encoding='utf-8') as fp:
+                    for audio_file in paths2audio_files:
+                        entry = {'audio_filepath': audio_file, 'duration': 100000, 'text': ''}
+                        fp.write(json.dumps(entry) + '\n')
+
+                config = {
+                    'manifest_filepath': manifest_filepath,
+                    'paths2audio_files': paths2audio_files,
+                    'batch_size': batch_size,
+                    'temp_dir': tmpdir,
+                    'num_workers': num_workers,
+                    # 'channel_selector': channel_selector,
+                }
+
+                if augmentor:
+                    config['augmentor'] = augmentor
+
+                temporary_datalayer = self._setup_transcribe_dataloader(config)
+
+                for test_batch in tqdm(temporary_datalayer, desc="Transcribing", disable=(not verbose)):
+                    encoded, encoded_len = self.forward(
+                        input_signal=test_batch[0].to(device), input_signal_length=test_batch[1].to(device), target_lang_id=test_batch[4].to(device)
+                    )
+                    best_hyp, all_hyp = self.decoding.rnnt_decoder_predictions_tensor(
+                        encoded,
+                        encoded_len,
+                        return_hypotheses=return_hypotheses,
+                        partial_hypotheses=partial_hypothesis,
+                    )
+
+                    hypotheses += best_hyp
+                    if all_hyp is not None:
+                        all_hypotheses += all_hyp
+                    else:
+                        all_hypotheses += best_hyp
+
+                    del encoded
+                    del test_batch
+        finally:
+            # set mode back to its original value
+            self.train(mode=mode)
+            self.preprocessor.featurizer.dither = dither_value
+            self.preprocessor.featurizer.pad_to = pad_to_value
+
+            logging.set_verbosity(logging_level)
+            if mode is True:
+                self.encoder.unfreeze()
+                self.decoder.unfreeze()
+                self.joint.unfreeze()
+        return hypotheses, all_hypotheses
 
     @property
     def bleu(self):
