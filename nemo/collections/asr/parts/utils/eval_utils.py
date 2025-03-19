@@ -16,6 +16,7 @@ import json
 import re
 from typing import Optional, Tuple, Union
 
+from omegaconf import DictConfig
 from torchmetrics.text import SacreBLEUScore
 from torchmetrics.text.rouge import ROUGEScore
 
@@ -26,9 +27,8 @@ from nemo.utils.nemo_logging import LogMode
 TEXT_METRICS_MAPPING = {
     'bleu': SacreBLEUScore,
     'rouge': ROUGEScore,
+    # Note: 'wer' is handled separately through word_error_rate_detail
 }
-
-from omegaconf import DictConfig
 
 
 def flatten_dict_config(config: DictConfig, parent_key='', sep='.', join='\n') -> str:
@@ -95,8 +95,8 @@ def clean_label(_str: str, num_to_words: bool = True, langid="en") -> str:
     Remove unauthorized characters in a string, lower it and remove unneeded spaces
     """
     replace_with_space = [char for char in '/?*\",.:=?_{|}~¨«·»¡¿„…‧‹›≪≫!:;ː→']
-    replace_with_blank = [char for char in '`¨´‘’“”`ʻ‘’“"‘”']
-    replace_with_apos = [char for char in '‘’ʻ‘’‘']
+    replace_with_blank = [char for char in '`¨´\'\'"""`ʻ\'\'""\'']
+    replace_with_apos = [char for char in '\'\'\'ʻ\'\'\'']
     _str = _str.strip()
     _str = _str.lower()
     for i in replace_with_blank:
@@ -185,9 +185,9 @@ def cal_write_wer(
                     gt_text_attr_name = "text"
                 else:
                     logging.info(
-                        f"ground-truth text attribute {gt_text_attr_name} is not present in manifest! Cannot calculate WER. Returning!"
+                        f"ground-truth text attribute {gt_text_attr_name} is not present in manifest! Cannot calculate {eval_metric}. Returning!"
                     )
-                return None, None, eval_metric
+                    return None, None, eval_metric
 
             hyp = sample[pred_text_attr_name].strip()
             ref = sample[gt_text_attr_name].strip()
@@ -209,7 +209,7 @@ def cal_write_wer(
             wer, tokens, ins_rate, del_rate, sub_rate = word_error_rate_detail(
                 hypotheses=[hyp], references=[ref], use_cer=use_cer
             )
-            sample[eval_metric] = wer  # evaluatin metric, could be word error rate of character error rate
+            sample[eval_metric] = wer  # evaluation metric, could be word error rate of character error rate
             sample['tokens'] = tokens  # number of word/characters/tokens
             sample['ins_rate'] = ins_rate  # insertion error rate
             sample['del_rate'] = del_rate  # deletion error rate
@@ -245,6 +245,82 @@ def cal_write_wer(
     return output_manifest_w_wer, total_res, eval_metric
 
 
+def cal_write_bleu(
+    pred_manifest: str = None,
+    gt_text_attr_name: str = "text",
+    pred_text_attr_name: str = "pred_text",
+    langid: str = 'en',
+    use_cer: bool = False,  # Unused parameter, kept for API consistency
+    clean_groundtruth_text: bool = False,  # Unused parameter, kept for API consistency
+    output_filename: str = None,
+    ignore_capitalization: bool = False,
+    ignore_punctuation: bool = False,   
+    punctuations: Optional[list] = None,
+    strip_punc_space: bool = False,
+) -> Tuple[str, dict, str]:
+    """
+    Calculate bleu score based on groundtruth text and pred_text_attr_name (pred_text) 
+    """
+    samples = []
+    hyps = []
+    refs = []
+    metric = "bleu"  # Define metric variable to avoid NameError
+
+    metric_calculator = TEXT_METRICS_MAPPING["bleu"]()
+    
+    with open(pred_manifest, 'r') as fp:
+        for line in fp:
+            sample = json.loads(line)   
+
+            if gt_text_attr_name not in sample:
+                if "text" in sample:
+                    gt_text_attr_name = "text"
+                else:
+                    logging.info(
+                        f"ground-truth text attribute {gt_text_attr_name} is not present in manifest! Cannot calculate {metric}. Returning!"
+                    )
+                    return None, None, metric
+
+            hyp = sample[pred_text_attr_name].strip()
+            ref = sample[gt_text_attr_name].strip()
+
+            if ignore_punctuation:
+                ref = remove_punctuations(ref, punctuations=punctuations)
+                hyp = remove_punctuations(hyp, punctuations=punctuations)
+            elif strip_punc_space:
+                ref = strip_spaces_before_punctuations(ref)
+                hyp = strip_spaces_before_punctuations(hyp)
+
+            if ignore_capitalization:
+                ref = ref.lower()
+                hyp = hyp.lower()
+
+            bleu_score = metric_calculator([hyp], [[ref]]).item()
+            sample["bleu"] = round(100 * bleu_score, 2)
+
+            samples.append(sample)
+            hyps.append(hyp)
+            refs.append(ref)
+
+    total_bleu = metric_calculator(hyps, [[r] for r in refs]).item()
+
+    if not output_filename:
+        output_manifest_w_metric = pred_manifest
+    else:
+        output_manifest_w_metric = output_filename
+        
+    with open(output_manifest_w_metric, 'w') as fout:
+        for sample in samples:
+            json.dump(sample, fout)
+            fout.write('\n')
+            fout.flush()
+
+    total_res = {
+        "samples": len(samples),
+        "bleu": round(100 * total_bleu, 2),
+    }
+    return output_manifest_w_metric, total_res, metric
+
 def cal_write_text_metric(
     pred_manifest: str = None,
     gt_text_attr_name: str = "text",
@@ -256,14 +332,32 @@ def cal_write_text_metric(
     metric: str = 'bleu',
     metric_args: Optional[dict] = None,
     strip_punc_space: bool = False,
-):
+) -> Tuple[str, dict, str]:
+    """
+    Calculate text metrics (bleu, rouge, etc.) based on groundtruth text and pred_text_attr_name
+    """
     samples = []
     hyps = []
     refs = []
 
-    if metric not in TEXT_METRICS_MAPPING:
-        raise ValueError(f"metric {metric} is not supported! Please choose from {TEXT_METRICS_MAPPING.keys()}")
+    if metric not in TEXT_METRICS_MAPPING and metric != 'wer' and metric != 'cer':
+        raise ValueError(f"metric {metric} is not supported! Please choose from {list(TEXT_METRICS_MAPPING.keys()) + ['wer', 'cer']}")
 
+    # Handle WER/CER separately as they use word_error_rate_detail
+    if metric in ['wer', 'cer']:
+        use_cer = (metric == 'cer')
+        return cal_write_wer(
+            pred_manifest=pred_manifest,
+            gt_text_attr_name=gt_text_attr_name,
+            pred_text_attr_name=pred_text_attr_name,
+            output_filename=output_filename,
+            ignore_capitalization=ignore_capitalization,
+            ignore_punctuation=ignore_punctuation,
+            punctuations=punctuations,
+            strip_punc_space=strip_punc_space,
+            use_cer=use_cer
+        )
+    
     metric_calculator = TEXT_METRICS_MAPPING[metric](**metric_args) if metric_args else TEXT_METRICS_MAPPING[metric]()
     with open(pred_manifest, 'r') as fp:
         for line in fp:
@@ -276,7 +370,7 @@ def cal_write_text_metric(
                     logging.info(
                         f"ground-truth text attribute {gt_text_attr_name} is not present in manifest! Cannot calculate {metric}. Returning!"
                     )
-                return None, None, metric
+                    return None, None, metric
 
             hyp = sample[pred_text_attr_name].strip()
             ref = sample[gt_text_attr_name].strip()
@@ -296,22 +390,23 @@ def cal_write_text_metric(
                 score = metric_calculator([hyp], [[ref]]).item()
             else:
                 score = metric_calculator(hyp, ref).item()
-            sample[metric] = score  # evaluatin metric, could be word error rate of character error rate
+            sample[metric] = score  # evaluation metric, could be word error rate of character error rate
 
             samples.append(sample)
             hyps.append(hyp)
             refs.append(ref)
 
+    # Format references correctly for batch calculation
     if metric == 'bleu':
         refs = [[ref] for ref in refs]
     total_score = metric_calculator(hyps, refs).item()
 
     if not output_filename:
-        output_manifest_w_wer = pred_manifest
+        output_manifest_w_metric = pred_manifest
     else:
-        output_manifest_w_wer = output_filename
+        output_manifest_w_metric = output_filename
 
-    with open(output_manifest_w_wer, 'w') as fout:
+    with open(output_manifest_w_metric, 'w') as fout:
         for sample in samples:
             json.dump(sample, fout)
             fout.write('\n')
@@ -321,4 +416,4 @@ def cal_write_text_metric(
         "samples": len(samples),
         metric: total_score,
     }
-    return output_manifest_w_wer, total_res, metric
+    return output_manifest_w_metric, total_res, metric

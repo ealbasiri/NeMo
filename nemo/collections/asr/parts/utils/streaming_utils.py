@@ -13,8 +13,14 @@
 # limitations under the License.
 
 import copy
+import json
+import math
 import os
-from typing import Optional
+import pickle
+import random
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -998,6 +1004,7 @@ class BatchedFrameASRRNNT(FrameBatchASR):
         batch_size=32,
         max_steps_per_timestep: int = 5,
         stateful_decoding: bool = False,
+        target_lang_id=None,
     ):
         '''
         Args:
@@ -1007,12 +1014,14 @@ class BatchedFrameASRRNNT(FrameBatchASR):
             batch_size: Number of independent audio samples to process at each step.
             max_steps_per_timestep: Maximum number of tokens (u) to process per acoustic timestep (t).
             stateful_decoding: Boolean whether to enable stateful decoding for preservation of state across buffers.
+            target_lang_id: Optional target language ID for multilingual AST models.
         '''
         super().__init__(asr_model, frame_len=frame_len, total_buffer=total_buffer, batch_size=batch_size)
 
         # OVERRIDES OF THE BASE CLASS
         self.max_steps_per_timestep = max_steps_per_timestep
         self.stateful_decoding = stateful_decoding
+        self.target_lang_id = target_lang_id 
 
         self.all_alignments = [[] for _ in range(self.batch_size)]
         self.all_preds = [[] for _ in range(self.batch_size)]
@@ -1028,6 +1037,8 @@ class BatchedFrameASRRNNT(FrameBatchASR):
             self.eos_id = -1
 
         print("Performing Stateful decoding :", self.stateful_decoding)
+        if self.target_lang_id is not None:
+            print("Using target language ID:", self.target_lang_id)
 
         # OVERRIDES
         self.frame_bufferer = BatchedFeatureFrameBufferer(
@@ -1053,6 +1064,25 @@ class BatchedFrameASRRNNT(FrameBatchASR):
             DataLoader(self.data_layer[idx], batch_size=1, collate_fn=speech_collate_fn)
             for idx in range(self.batch_size)
         ]
+        # Method for target_lang_id
+    def set_target_lang_id(self, target_lang_id):
+        """
+        Set target language ID for transcription.
+        
+        Args:
+            target_lang_id: Target language ID to use for decoding.
+        """
+        self.target_lang_id = target_lang_id
+        
+        # Print information about the language ID
+        if isinstance(target_lang_id, str):
+            # Check if the model has the global language map
+            if hasattr(self.asr_model, '_GLOBAL_LANG_MAP'):
+                lang_id_index = self.asr_model._GLOBAL_LANG_MAP.get(target_lang_id, None)
+        else:
+            print(f"No lang id index. Set target language ID index: {target_lang_id}")
+            if hasattr(self.asr_model, 'num_langs'):
+                print(f"Model supports {self.asr_model.num_langs} languages")
 
     def read_audio_file(self, audio_filepath: list, delay, model_stride_in_secs):
         assert len(audio_filepath) == self.batch_size
@@ -1085,43 +1115,35 @@ class BatchedFrameASRRNNT(FrameBatchASR):
     def _get_batch_preds(self):
         """
         Perform dynamic batch size decoding of frame buffers of all samples.
-
-        Steps:
-            -   Load all data loaders of every sample
-            -   For all samples, determine if signal has finished.
-                -   If so, skip calculation of mel-specs.
-                -   If not, compute mel spec and length
-            -   Perform Encoder forward over this sub-batch of samples. Maintain the indices of samples that were processed.
-            -   If performing stateful decoding, prior to decoder forward, remove the states of samples that were not processed.
-            -   Perform Decoder + Joint forward for samples that were processed.
-            -   For all output RNNT alignment matrix of the joint do:
-                -   If signal has ended previously (this was last buffer of padding), skip alignment
-                -   Otherwise, recalculate global index of this sample from the sub-batch index, and preserve alignment.
-            -   Same for preds
-            -   Update indices of sub-batch with global index map.
-            - Redo steps until all samples were processed (sub-batch size == 0).
+        Modified to work with Riva-style alignment decoding.
         """
         device = self.asr_model.device
 
-        data_iters = [iter(data_loader) for data_loader in self.data_loader]
+        # Initialize data iterators from data loaders
+        data_iters = [iter(loader) for loader in self.data_loader]
 
         feat_signals = []
         feat_signal_lens = []
 
         new_batch_keys = []
-        # while not all(self.frame_bufferer.signal_end):
+        # Process each batch item
         for idx in range(self.batch_size):
             if self.frame_bufferer.signal_end[idx]:
                 continue
 
             batch = next(data_iters[idx])
-            feat_signal, feat_signal_len = batch
-            feat_signal, feat_signal_len = feat_signal.to(device), feat_signal_len.to(device)
-
+            if len(batch) == 2:
+                feat_signal, feat_signal_len = batch
+                feat_signal, feat_signal_len = feat_signal.to(device), feat_signal_len.to(device)
+            # Handle case where batch also includes target_lang_id 
+            elif len(batch) == 3:
+                feat_signal, feat_signal_len, _ = batch
+                feat_signal, feat_signal_len = feat_signal.to(device), feat_signal_len.to(device)
+                
             feat_signals.append(feat_signal)
             feat_signal_lens.append(feat_signal_len)
 
-            # preserve batch indeices
+            # preserve batch indices
             new_batch_keys.append(idx)
 
         if len(feat_signals) == 0:
@@ -1131,9 +1153,46 @@ class BatchedFrameASRRNNT(FrameBatchASR):
         feat_signal_len = torch.cat(feat_signal_lens, 0)
 
         del feat_signals, feat_signal_lens
+        
+        # Handle target language ID if needed
+        target_lang_tensor = None
+        if self.target_lang_id is not None and hasattr(self.asr_model, 'num_langs'):
+            if isinstance(self.target_lang_id, str):
+                if hasattr(self.asr_model, '_GLOBAL_LANG_MAP'):
+                    lang_id_index = self.asr_model._GLOBAL_LANG_MAP.get(self.target_lang_id, 0)
+            else:
+                lang_id_index = self.target_lang_id
+                print(f"Warning: No lang id index for target lang ID {lang_id_index}")
+                
+            # Create target language tensor
+            # Calculate the hidden size (time dimension after encoder processing)
+# Calculate the hidden size (time dimension after encoder processing)
+            time_length = feat_signal.shape[2]
+            hidden_length = math.ceil(time_length / 8)
 
-        encoded, encoded_len = self.asr_model(processed_signal=feat_signal, processed_signal_length=feat_signal_len)
-
+            num_langs = self.asr_model.num_langs# Create language ID tensor with calculated time dimension
+            target_lang_tensor = torch.zeros(
+                [feat_signal.size(0), hidden_length, num_langs],
+                dtype=feat_signal.dtype,
+                device=device
+            )
+            
+            # Set the target language
+            for i in range(target_lang_tensor.size(0)):
+                target_lang_tensor[i, :, lang_id_index] = 1
+        
+        if target_lang_tensor is not None:
+            encoded, encoded_len = self.asr_model.forward(
+                processed_signal=feat_signal, 
+                processed_signal_length=feat_signal_len,
+                target_lang_id=target_lang_tensor
+            )
+        else:
+            encoded, encoded_len = self.asr_model.forward(
+                processed_signal=feat_signal, 
+                processed_signal_length=feat_signal_len
+            )
+        
         # filter out partial hypotheses from older batch subset
         if self.stateful_decoding and self.previous_hypotheses is not None:
             new_prev_hypothesis = []
@@ -1141,11 +1200,15 @@ class BatchedFrameASRRNNT(FrameBatchASR):
                 old_pos = self.batch_index_map[global_index_key]
                 new_prev_hypothesis.append(self.previous_hypotheses[old_pos])
             self.previous_hypotheses = new_prev_hypothesis
-
-        best_hyp, _ = self.asr_model.decoding.rnnt_decoder_predictions_tensor(
-            encoded, encoded_len, return_hypotheses=True, partial_hypotheses=self.previous_hypotheses
+        
+        best_hyp, all_hyp = self.asr_model.decoding.rnnt_decoder_predictions_tensor(
+            encoder_output=encoded,
+            encoded_lengths=encoded_len,
+            return_hypotheses=True,
+            partial_hypotheses=self.previous_hypotheses,
         )
-
+        
+        
         if self.stateful_decoding:
             # preserve last state from hypothesis of new batch indices
             self.previous_hypotheses = best_hyp
@@ -1166,12 +1229,13 @@ class BatchedFrameASRRNNT(FrameBatchASR):
                 self.all_preds[global_index_key].append(pred.cpu().numpy())
 
         timestamps = [hyp.timestep for hyp in best_hyp]
-        for idx, timestep in enumerate(timestamps):
+  
+        for idx, timestamp in enumerate(timestamps):
             global_index_key = new_batch_keys[idx]  # get index of this sample in the global batch
 
             has_signal_ended = self.frame_bufferer.signal_end[global_index_key]
             if not has_signal_ended:
-                self.all_timestamps[global_index_key].append(timestep)
+                self.all_timestamps[global_index_key].append(timestamp)
 
         if self.stateful_decoding:
             # State resetting is being done on sub-batch only, global index information is not being updated
@@ -1200,26 +1264,38 @@ class BatchedFrameASRRNNT(FrameBatchASR):
     ):
         """
         Performs "middle token" alignment prediction using the buffered audio chunk.
+        Uses Riva-style alignment decoding for token extraction.
         """
         self.infer_logits()
-
+        
+        # Initialize unmerged lists for each batch item
         self.unmerged = [[] for _ in range(self.batch_size)]
-        for idx, alignments in enumerate(self.all_alignments):
 
+        for idx, alignments in enumerate(self.all_alignments):
+            
+            # Check if signal has ended
             signal_end_idx = self.frame_bufferer.signal_end_index[idx]
             if signal_end_idx is None:
                 raise ValueError("Signal did not end")
-
+            
+            # Process each alignment in the set
             for a_idx, alignment in enumerate(alignments):
+                
+                # Determine offset based on delay and alignment length
                 if delay == len(alignment):  # chunk size = buffer size
                     offset = 0
                 else:  # all other cases
                     offset = 1
 
+                
+                # Calculate slice indices with safety checks
+                start_idx = len(alignment) - offset - delay
+                end_idx = len(alignment) - offset - delay + tokens_per_chunk
+                alignment_slice = alignment[start_idx:end_idx]
+                
                 alignment = alignment[
                     len(alignment) - offset - delay : len(alignment) - offset - delay + tokens_per_chunk
                 ]
-
                 ids, toks = self._alignment_decoder(alignment, self.asr_model.tokenizer, self.blank_id)
 
                 if len(ids) > 0 and a_idx < signal_end_idx:
@@ -1233,6 +1309,7 @@ class BatchedFrameASRRNNT(FrameBatchASR):
         output = []
         for idx in range(self.batch_size):
             output.append(self.greedy_merge(self.unmerged[idx]))
+
         return output
 
     def _alignment_decoder(self, alignments, tokenizer, blank_id):
@@ -1665,7 +1742,6 @@ class FrameBatchMultiTaskAED(FrameBatchASR):
         unsued params are for keeping the same signature as the parent class
         """
         self.infer_logits(keep_logits)
-
         hypothesis = " ".join(self.all_preds)
         if not keep_logits:
             return hypothesis
@@ -1713,7 +1789,7 @@ class FrameBatchChunkedRNNT(FrameBatchASR):
         unsued params are for keeping the same signature as the parent class
         """
         self.infer_logits(keep_logits)
-
+        import pdb; pdb.set_trace()
         hypothesis = " ".join(self.all_preds)
         if not keep_logits:
             return hypothesis

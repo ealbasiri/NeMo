@@ -25,12 +25,14 @@ from tqdm.auto import tqdm
 
 import nemo.collections.asr as nemo_asr
 from nemo.collections.asr.metrics.wer import word_error_rate
+from nemo.collections.asr.metrics.bleu import BLEU
 from nemo.collections.asr.models import ASRModel, EncDecHybridRNNTCTCModel, EncDecMultiTaskModel
 from nemo.collections.asr.parts.utils import manifest_utils, rnnt_utils
 from nemo.collections.asr.parts.utils.streaming_utils import FrameBatchASR, FrameBatchMultiTaskAED
 from nemo.collections.common.metrics.punct_er import OccurancePunctuationErrorRate
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
 from nemo.utils import logging, model_utils
+from torchmetrics.text import SacreBLEUScore
 
 
 def get_buffered_pred_feat_rnnt(
@@ -41,6 +43,7 @@ def get_buffered_pred_feat_rnnt(
     batch_size: int,
     manifest: str = None,
     filepaths: List[list] = None,
+    target_lang_id: str = None,
 ) -> List[rnnt_utils.Hypothesis]:
     """
     Moved from examples/asr/asr_chunked_inference/rnnt/speech_to_text_buffered_infer_rnnt.py
@@ -48,6 +51,7 @@ def get_buffered_pred_feat_rnnt(
     """
     hyps = []
     refs = []
+    lang_ids = []
 
     if filepaths and manifest:
         raise ValueError("Please select either filepaths or manifest")
@@ -65,22 +69,47 @@ def get_buffered_pred_feat_rnnt(
                 if 'text' in row:
                     refs.append(row['text'])
 
+                # Extract language from manifest
+                if 'target_lang' in row:
+                    lang_ids.append(row['target_lang'])
+                elif 'lang' in row:
+                    lang_ids.append(row['lang'])
+                else:
+                    # Use target_lang_id as fallback
+                    lang_ids.append(target_lang_id)
+                
+    else:
+        # If filepaths are provided directly, use lang_id from config for all
+        lang_ids = [target_lang_id] * len(filepaths)
+
     with torch.inference_mode():
         with torch.cuda.amp.autocast():
             batch = []
+            batch_lang_ids = []  # Initialize here instead of clearing
             asr.sample_offset = 0
             for idx in tqdm(range(len(filepaths)), desc='Sample:', total=len(filepaths)):
-                batch.append((filepaths[idx]))
+                batch.append(filepaths[idx])
+                batch_lang_ids.append(lang_ids[idx])
 
                 if len(batch) == batch_size:
                     audio_files = [sample for sample in batch]
-
+                    
+                    # Reset ASR for new batch
                     asr.reset()
+                    
+                    # Set the language ID if any valid language ID exists
+                    if any(lid is not None for lid in batch_lang_ids):
+                        # Find the first non-None language ID to use
+                        lang_id = next((lid for lid in batch_lang_ids if lid is not None), None)
+                        if lang_id is not None:
+                            asr.set_target_lang_id(lang_id)
+                    
                     asr.read_audio_file(audio_files, delay, model_stride_in_secs)
                     hyp_list = asr.transcribe(tokens_per_chunk, delay)
                     hyps.extend(hyp_list)
 
                     batch.clear()
+                    batch_lang_ids.clear()
                     asr.sample_offset += batch_size
 
             if len(batch) > 0:
@@ -88,12 +117,19 @@ def get_buffered_pred_feat_rnnt(
                 asr.frame_bufferer.batch_size = len(batch)
                 asr.reset()
 
+                # Set the language ID for the remaining batch
+                if any(lid is not None for lid in batch_lang_ids):
+                    lang_id = next((lid for lid in batch_lang_ids if lid is not None), None)
+                    if lang_id is not None:
+                        asr.set_target_lang_id(lang_id)
+
                 audio_files = [sample for sample in batch]
                 asr.read_audio_file(audio_files, delay, model_stride_in_secs)
                 hyp_list = asr.transcribe(tokens_per_chunk, delay)
                 hyps.extend(hyp_list)
 
                 batch.clear()
+                batch_lang_ids.clear()
                 asr.sample_offset += len(batch)
 
     if os.environ.get('DEBUG', '0') in ('1', 'y', 't'):
@@ -577,7 +613,7 @@ def compute_metrics_per_sample(
     manifest_path: str,
     reference_field: str = "text",
     hypothesis_field: str = "pred_text",
-    metrics: List[str] = ["wer"],
+    metrics: List[str] = ["bleu"],
     punctuation_marks: List[str] = [".", ",", "?"],
     output_manifest_path: str = None,
 ) -> dict:
@@ -588,7 +624,7 @@ def compute_metrics_per_sample(
         manifest_path: str, Required - path to dataset JSON manifest file (in NeMo format)
         reference_field: str, Optional - name of field in .json manifest with the reference text ("text" by default).
         hypothesis_field: str, Optional - name of field in .json manifest with the hypothesis text ("pred_text" by default).
-        metrics: list[str], Optional - list of metrics to be computed (currently supported "wer", "cer", "punct_er")
+        metrics: list[str], Optional - list of metrics to be computed (currently supported "wer", "cer", "punct_er", "bleu")
         punctuation_marks: list[str], Optional - list of punctuation marks for computing punctuation error rate ([".", ",", "?"] by default).
         output_manifest_path: str, Optional - path where .json manifest with calculated metrics will be saved.
 
@@ -596,7 +632,7 @@ def compute_metrics_per_sample(
         samples: dict - Dict of samples with calculated metrics
     '''
 
-    supported_metrics = ["wer", "cer", "punct_er"]
+    supported_metrics = ["wer", "cer", "punct_er", "bleu"]
 
     if len(metrics) == 0:
         raise AssertionError(
@@ -620,6 +656,11 @@ def compute_metrics_per_sample(
     use_wer = "wer" in metrics
     use_cer = "cer" in metrics
     use_punct_er = "punct_er" in metrics
+    use_bleu = "bleu" in metrics
+    
+    # Initialize BLEU scorer if needed
+    if use_bleu:
+        bleu_scorer = SacreBLEUScore()
 
     with open(manifest_path, 'r') as manifest:
         lines = manifest.readlines()
@@ -649,6 +690,12 @@ def compute_metrics_per_sample(
                 sample["punct_insertions_rate"] = round(100 * punctuation_rates.insertions_rate, 2)
                 sample["punct_substitutions_rate"] = round(100 * punctuation_rates.substitutions_rate, 2)
                 sample["punct_error_rate"] = round(100 * punctuation_rates.punct_er, 2)
+
+            if use_bleu:
+                # Calculate BLEU score for this sample
+                # SacreBLEUScore expects a list of hypotheses and a list of list of references
+                bleu_score = bleu_scorer([hypothesis], [[reference]]).item()
+                sample["bleu"] = round(100 * bleu_score, 2)
 
             samples_with_metrics.append(sample)
 

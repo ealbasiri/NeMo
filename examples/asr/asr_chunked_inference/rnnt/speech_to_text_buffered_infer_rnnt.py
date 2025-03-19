@@ -139,7 +139,7 @@ class TranscriptionConfig:
     clean_groundtruth_text: bool = False
     langid: str = "en"  # specify this for convert_num_to_words step in groundtruth cleaning
     use_cer: bool = False
-
+    
 
 @hydra_runner(config_name="TranscriptionConfig", schema=TranscriptionConfig)
 def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
