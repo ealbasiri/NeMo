@@ -12,13 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import shutil
 import tempfile
 
+import numpy as np
 import pytest
+import soundfile as sf
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, open_dict
 
 from nemo.collections.asr.models.rnnt_bpe_models_prompt import EncDecRNNTBPEModelWithPrompt
 from nemo.collections.asr.parts.submodules import rnnt_beam_decoding as beam_decode
@@ -407,3 +410,78 @@ class TestEncDecRNNTBPEModelWithPrompt:
         assert out_a.shape == out_b.shape
         # The prompt projection should make outputs differ for different language ids.
         assert torch.max(torch.abs(out_a - out_b)) > 0
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("via_override_config", [False, True])
+    def test_transcribe_paths_uses_target_lang(
+        self, rnnt_asr_model_with_prompt, tmp_path, monkeypatch, via_override_config
+    ):
+        """transcribe() on audio file paths must condition every sample on the requested target_lang."""
+        model = rnnt_asr_model_with_prompt.eval()
+        audio_files = _write_audio_files(tmp_path, count=3)
+        captured = _capture_prompt_indices(model, monkeypatch)
+
+        if via_override_config:
+            trcfg = model.get_transcribe_config()
+            trcfg.batch_size = 2
+            trcfg.target_lang = 'de_DE'
+            model.transcribe(audio_files, override_config=trcfg)
+        else:
+            model.transcribe(audio_files, batch_size=2, target_lang='de_DE')
+
+        assert captured == [3, 3, 3]
+
+    @pytest.mark.unit
+    def test_transcribe_paths_defaults_to_auto_prompt(self, rnnt_asr_model_with_prompt, tmp_path, monkeypatch):
+        """Without target_lang, transcribe() on file paths must use the auto prompt instead of failing."""
+        model = rnnt_asr_model_with_prompt.eval()
+        with open_dict(model.cfg):
+            model.cfg.model_defaults.prompt_dictionary['auto'] = 101
+        audio_files = _write_audio_files(tmp_path, count=3)
+        captured = _capture_prompt_indices(model, monkeypatch)
+
+        model.transcribe(audio_files, batch_size=2)
+
+        assert captured == [101, 101, 101]
+
+    @pytest.mark.unit
+    def test_transcribe_manifest_lang_takes_precedence_over_target_lang(
+        self, rnnt_asr_model_with_prompt, tmp_path, monkeypatch
+    ):
+        """A manifest entry's lang wins; target_lang only fills in entries that have none."""
+        model = rnnt_asr_model_with_prompt.eval()
+        audio_files = _write_audio_files(tmp_path, count=3)
+        manifest = tmp_path / 'manifest.json'
+        with open(manifest, 'w') as f:
+            for audio_file, lang in zip(audio_files, ['fr_FR', None, 'en_US']):
+                entry = {'audio_filepath': audio_file, 'duration': 1.0, 'text': ''}
+                if lang is not None:
+                    entry['lang'] = lang
+                f.write(json.dumps(entry) + '\n')
+        captured = _capture_prompt_indices(model, monkeypatch)
+
+        model.transcribe(str(manifest), batch_size=2, target_lang='es_ES')
+
+        assert captured == [2, 1, 0]
+
+
+def _write_audio_files(directory, count, sample_rate=16000, duration=1.0):
+    rng = np.random.default_rng(0)
+    paths = []
+    for i in range(count):
+        path = directory / f'audio_{i}.wav'
+        sf.write(path, rng.uniform(-0.1, 0.1, int(sample_rate * duration)).astype(np.float32), sample_rate)
+        paths.append(str(path))
+    return paths
+
+
+def _capture_prompt_indices(model, monkeypatch):
+    captured = []
+    forward = model.forward
+
+    def forward_and_capture(*args, **kwargs):
+        captured.extend(kwargs['prompt_indices'].tolist())
+        return forward(*args, **kwargs)
+
+    monkeypatch.setattr(model, 'forward', forward_and_capture)
+    return captured
