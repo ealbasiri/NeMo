@@ -28,7 +28,10 @@ from nemo.collections.asr.data.audio_to_text_lhotse_prompt_index import LhotseSp
 from nemo.collections.asr.metrics.wer import WER
 from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
 from nemo.collections.asr.parts.mixins import ASRTranscriptionMixin, PromptStreamingMixin, TranscribeConfig
-from nemo.collections.asr.parts.mixins.transcription import TranscriptionReturnType
+from nemo.collections.asr.parts.mixins.transcription import (
+    TranscriptionReturnType,
+    get_value_from_transcription_config,
+)
 from nemo.collections.asr.parts.preprocessing.segment import ChannelSelectorType
 from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTBPEDecoding
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
@@ -226,6 +229,14 @@ class EncDecRNNTBPEModelWithPrompt(PromptStreamingMixin, EncDecRNNTBPEModel, ASR
             num_workers=config.get('num_workers', 0),
             pin_memory=config.get('pin_memory', False),
         )
+
+    def _transcribe_input_manifest_processing(
+        self, audio_files: List[str], temp_dir: str, trcfg: RNNTPromptTranscribeConfig
+    ) -> Dict:
+        """Adds target_lang, which the base config omits, so _setup_transcribe_dataloader can use it."""
+        ds_config = super()._transcribe_input_manifest_processing(audio_files, temp_dir, trcfg)
+        ds_config['target_lang'] = get_value_from_transcription_config(trcfg, 'target_lang', 'auto')
+        return ds_config
 
     def _setup_transcribe_dataloader(self, config: Dict) -> 'torch.utils.data.DataLoader':
         if 'manifest_filepath' in config:

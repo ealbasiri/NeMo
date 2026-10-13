@@ -29,7 +29,10 @@ from nemo.collections.asr.metrics.bleu import BLEU
 from nemo.collections.asr.metrics.wer import WER
 from nemo.collections.asr.models.hybrid_rnnt_ctc_bpe_models import EncDecHybridRNNTCTCBPEModel
 from nemo.collections.asr.parts.mixins import ASRTranscriptionMixin, PromptStreamingMixin, TranscribeConfig
-from nemo.collections.asr.parts.mixins.transcription import TranscriptionReturnType
+from nemo.collections.asr.parts.mixins.transcription import (
+    TranscriptionReturnType,
+    get_value_from_transcription_config,
+)
 from nemo.collections.asr.parts.preprocessing.segment import ChannelSelectorType
 from nemo.collections.asr.parts.submodules.ctc_decoding import CTCBPEDecoding, CTCBPEDecodingConfig
 from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTBPEDecoding
@@ -245,6 +248,14 @@ class EncDecHybridRNNTCTCBPEModelWithPrompt(PromptStreamingMixin, EncDecHybridRN
             pin_memory=config.get('pin_memory', False),
         )
 
+    def _transcribe_input_manifest_processing(
+        self, audio_files: List[str], temp_dir: str, trcfg: HybridRNNTCTCPromptTranscribeConfig
+    ) -> Dict:
+        """Adds target_lang, which the base config omits, so _setup_transcribe_dataloader can use it."""
+        ds_config = super()._transcribe_input_manifest_processing(audio_files, temp_dir, trcfg)
+        ds_config['target_lang'] = get_value_from_transcription_config(trcfg, 'target_lang', 'auto')
+        return ds_config
+
     def _setup_transcribe_dataloader(self, config: Dict) -> 'torch.utils.data.DataLoader':
         """
         Setup function for a temporary data loader which wraps the provided audio file.
@@ -270,7 +281,7 @@ class EncDecHybridRNNTCTCBPEModelWithPrompt(PromptStreamingMixin, EncDecHybridRN
             batch_size = min(config['batch_size'], len(config['paths2audio_files']))
 
         # Get target language from config
-        target_lang = config.get('target_lang', 'en-US')
+        target_lang = config.get('target_lang', 'auto')
 
         dl_config = {
             'manifest_filepath': manifest_filepath,
@@ -289,6 +300,7 @@ class EncDecHybridRNNTCTCBPEModelWithPrompt(PromptStreamingMixin, EncDecHybridRN
             'num_prompts': self.cfg.model_defaults.get('num_prompts', 128),
             'subsampling_factor': self.cfg.get('subsampling_factor', 8),
             'default_lang': target_lang,
+            'default_prompt_mode': 'langID',
             'window_stride': self.cfg.preprocessor.get('window_stride', 0.01),
         }
 
