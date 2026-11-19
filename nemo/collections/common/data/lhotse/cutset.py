@@ -316,10 +316,18 @@ def parse_group(grp_cfg: DictConfig, propagate_attrs: dict) -> [CutSet, bool]:
             grp_cfg.input_cfg,
             propagate_attrs=propagate_attrs,
         )
+    # Keep only samples whose manifest row has ``high_quality: true`` (e.g. Granary), if requested.
+    if grp_cfg.get("high_quality_only", False):
+        cuts = cuts.filter(_is_high_quality)
     # Attach extra tags to every utterance dynamically, if provided.
     if (extra_tags := grp_cfg.get("tags")) is not None:
         cuts = cuts.map(partial(attach_tags, tags=extra_tags), apply_fn=None)
     return cuts, is_tarred
+
+
+def _is_high_quality(cut) -> bool:
+    # Module-level (not a lambda) so it stays picklable for dataloader workers.
+    return bool((getattr(cut, "custom", None) or {}).get("high_quality", False))
 
 
 def _resolve_index_pack(config) -> Path | None:

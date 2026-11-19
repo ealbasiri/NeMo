@@ -312,6 +312,34 @@ class EncDecRNNTBPEModelWithPrompt(PromptStreamingMixin, EncDecRNNTBPEModel, ASR
             "encoded_lengths": NeuralType(tuple('B'), LengthsType()),
         }
 
+    def on_validation_epoch_start(self) -> None:
+        """
+        Release cached-but-unused blocks back to the CUDA driver before validating.
+
+        Training batch sizes come from OOMptimizer, so the caching allocator ends up
+        reserving nearly the whole device and never hands it back. Validation then feeds
+        sequence lengths that training never produces (batch size 1, no bucketing), and
+        flex_attention has to load a Triton kernel for the new shape -- an allocation the
+        driver makes outside the allocator pool. Without this, that load fails with
+        "CUDA driver error: out of memory" and takes the whole job down via NCCL timeouts.
+        """
+        super().on_validation_epoch_start()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    @property
+    def oomptimizer_schema(self) -> dict:
+        """
+        Return a typing schema for optimal batch size calibration using OOMptimizer.
+
+        Overrides ASRModel's four-tensor schema because training_step here unpacks a fifth
+        element, prompt_indices. It must be a (B,) tensor of indices below num_prompts,
+        since forward scatters it into a one-hot of that width.
+        """
+        schema = super().oomptimizer_schema
+        schema["inputs"].append({"type": "batch_constant", "value": 0})
+        return schema
+
     @typecheck()
     def forward(
         self,

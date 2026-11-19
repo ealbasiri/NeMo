@@ -1,0 +1,274 @@
+name: "Transformer-Stacking-RNNT-1B-RelPos-Cache-Aware-Prompt"
+
+# 1B point of the cache-aware prompt series. The encoder shape matches the pretrained
+# English TDT 1B checkpoint (d_model 1536, n_layers 36, n_heads 16), so its encoder loads
+# unchanged: cache-aware attention only alters the FlexAttention mask, and the language
+# prompt is applied to the encoder *output* via prompt_kernel. Decoder and joint are
+# excluded at init -- that checkpoint is TDT over a 1024-token English vocabulary, while
+# this trains plain RNNT over the 40-language universal tokenizer.
+#
+# n_heads must stay 16 to match the checkpoint (head_dim 96). The 12-head / head_dim-128
+# variant the pretrain config suggests would be faster under FA-4 but cannot load these
+# weights.
+
+model:
+  sample_rate: 16000
+  compute_eval_loss: false
+  log_prediction: true
+  rnnt_reduction: mean_volume
+  skip_nan_grad: true
+
+  model_defaults:
+    enc_hidden: ${model.encoder.d_model}
+    pred_hidden: 640
+    joint_hidden: 640
+    initialize_prompt_feature: true
+    num_prompts: 128
+    prompt_dictionary: {
+      'en-US': 0, 'en': 0, 'en-GB': 1, 'enGB': 1, 'es-ES': 2, 'esES': 2, 'es-US': 3, 'es': 3,
+      'zh-CN': 4, 'zh-ZH': 4, 'zh-TW': 5, 'hi-IN': 6, 'hi': 6, 'hi-HI': 6, 'ar-AR': 7, 'ar': 7,
+      'fr-FR': 8, 'fr': 8, 'de-DE': 9, 'de': 9, 'ja-JP': 10, 'ja-JA': 10, 'ru-RU': 11, 'ru': 11,
+      'pt-BR': 12, 'pt-PT': 13, 'pt': 13, 'ko-KR': 14, 'ko': 14, 'ko-KO': 14, 'it-IT': 15, 'it': 15,
+      'nl-NL': 16, 'nl': 16, 'pl-PL': 17, 'pl': 17, 'tr-TR': 18, 'tr': 18, 'uk-UA': 19, 'uk': 19,
+      'ro-RO': 20, 'ro': 20, 'el-GR': 21, 'el': 21, 'cs-CZ': 22, 'cs': 22, 'hu-HU': 23, 'hu': 23,
+      'sv-SE': 24, 'sv': 24, 'da-DK': 25, 'da': 25, 'fi-FI': 26, 'fi': 26, 'no-NO': 27, 'no': 27,
+      'nb-NO': 103, 'nb': 103, 'nn-NO': 104, 'nn': 104, 'sk-SK': 28, 'sk': 28, 'hr-HR': 29, 'hr': 29,
+      'bg-BG': 30, 'bg': 30, 'lt-LT': 31, 'lt': 31, 'et-EE': 60, 'et': 60, 'lv-LV': 61, 'lv': 61,
+      'sl-SI': 62, 'sl': 62, 'th-TH': 32, 'vi-VN': 33, 'id-ID': 34, 'ms-MY': 35, 'bn-IN': 36,
+      'ur-PK': 37, 'fa-IR': 38, 'ta-IN': 39, 'te-IN': 40, 'mr-IN': 41, 'gu-IN': 42, 'kn-IN': 43,
+      'ml-IN': 44, 'si-LK': 45, 'ne-NP': 46, 'km-KH': 47, 'sw-KE': 48, 'am-ET': 49, 'ha-NG': 50,
+      'zu-ZA': 51, 'yo-NG': 52, 'ig-NG': 53, 'af-ZA': 54, 'rw-RW': 55, 'so-SO': 56, 'ny-MW': 57,
+      'ln-CD': 58, 'or-KE': 59, 'he-IL': 64, 'ku-TR': 65, 'az-AZ': 66, 'ka-GE': 67, 'hy-AM': 68,
+      'uz-UZ': 69, 'tg-TJ': 70, 'ky-KG': 71, 'qu-PE': 80, 'ay-BO': 81, 'gn-PY': 82, 'nah-MX': 83,
+      'mi-NZ': 96, 'haw-US': 97, 'sm-WS': 98, 'to-TO': 99, 'fr-CA': 100, 'mt-MT': 102, 'auto': 101
+    }
+
+  train_ds:
+    use_lhotse: true
+    skip_missing_manifest_entries: true
+    input_cfg: ???
+    manifest_filepath: null
+    tarred_audio_filepaths: null
+    sample_rate: ${model.sample_rate}
+    shuffle: true
+    num_workers: 4
+    pin_memory: true
+    max_duration: 40.0
+    min_duration: 0.1
+    min_tokens: 1
+    batch_size: null
+    # Per-bucket batch sizes come from OOMptimizer, so batching is driven by
+    # bucket_batch_size rather than batch_duration/quadratic_duration (those only apply to
+    # the TimeConstraint path and are ignored once bucket_batch_size is set). If you ever
+    # drop bucket_batch_size, you must set batch_duration or the loader refuses to start.
+    use_bucketing: true
+    # 2D (duration, token-count) bins from estimate_duration_bins_2d.py over 500k sampled
+    # utterances of the 40-language mix at max_duration=40 (slurm job 33664247):
+    #   estimate_duration_bins_40langs.sh 30 2 500000
+    # num_buckets is the duration-axis count (30); the bin list is 30 x 2 sub-buckets.
+    # The repeated 30.000 bins are real: ~1/6 of all audio in the mix is exactly 30.00s,
+    # so the estimator split that spike into extra token sub-buckets.
+    num_buckets: 30
+    bucket_duration_bins: [[2.300,16],[2.300,48],[3.420,26],[3.420,71],[4.219,32],[4.219,83],[5.020,39],[5.020,97],[5.906,46],[5.906,110],[6.900,56],[6.900,136],[8.000,63],[8.000,145],[9.079,70],[9.079,162],[10.007,75],[10.007,168],[11.280,89],[11.280,207],[12.540,100],[12.540,224],[13.745,107],[13.745,236],[14.880,115],[14.880,259],[15.913,118],[15.913,253],[16.872,121],[16.872,260],[17.736,128],[17.736,258],[18.560,133],[18.560,273],[19.339,139],[19.339,263],[19.997,144],[19.997,281],[23.340,143],[23.340,310],[26.720,162],[26.720,338],[30.000,133],[30.000,149],[30.000,160],[30.000,169],[30.000,178],[30.000,186],[30.000,195],[30.000,205],[30.000,217],[30.000,318],[30.008,280],[30.008,745],[30.024,187],[30.024,329],[34.680,214],[34.680,410],[40.000,266],[40.000,478]]
+    # OOMptimizer profile at 80% of an 80GB GPU with DDP overhead and bf16 simulated
+    # (slurm job 35785015). The previous 90% profile caused training-time CUDA OOMs.
+    bucket_batch_size: [343,249,210,140,160,102,121,77,98,60,77,44,62,37,51,29,44,27,35,19,29,16,25,13,23,11,21,11,19,9,17,9,15,9,15,9,13,7,11,5,9,3,9,8,7,7,7,7,7,5,5,3,4,1,7,3,5,1,3,1]
+    bucket_buffer_size: 20000
+    shuffle_buffer_size: 10000
+    defer_setup: true
+    lang_field: target_lang
+    prompt_dictionary: ${model.model_defaults.prompt_dictionary}
+    num_prompts: ${model.model_defaults.num_prompts}
+    default_prompt_mode: unified
+    unified_auto_ratio: 0.5
+    prompt_mode_field: prompt_mode
+
+  validation_ds:
+    use_lhotse: true
+    manifest_filepath: ???
+    sample_rate: ${model.sample_rate}
+    batch_size: 1
+    shuffle: false
+    max_duration: 20.0
+    min_duration: 0.1
+    num_workers: 0
+    pin_memory: true
+    drop_last: true
+    use_bucketing: false
+    lang_field: target_lang
+    prompt_dictionary: ${model.model_defaults.prompt_dictionary}
+    num_prompts: ${model.model_defaults.num_prompts}
+    default_prompt_mode: langID
+
+  test_ds:
+    # Training never uses a test set, and this model's setup_test_data builds a Lhotse
+    # dataloader unconditionally, which fails on a null manifest. defer_setup keeps these
+    # settings available for later evaluation without constructing a loader at init.
+    defer_setup: true
+    manifest_filepath: null
+    sample_rate: ${model.sample_rate}
+    batch_size: 1
+    shuffle: false
+    num_workers: 0
+    pin_memory: true
+    use_lhotse: true
+    use_bucketing: false
+    lang_field: target_lang
+    prompt_dictionary: ${model.model_defaults.prompt_dictionary}
+    num_prompts: ${model.model_defaults.num_prompts}
+    default_prompt_mode: langID
+
+  tokenizer:
+    dir: ???
+    type: bpe
+
+  preprocessor:
+    _target_: nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor
+    sample_rate: ${model.sample_rate}
+    normalize: "NA"
+    window_size: 0.025
+    window_stride: 0.01
+    window: hann
+    features: 128
+    n_fft: 512
+    log: true
+    frame_splicing: 1
+    dither: 0.00001
+    pad_to: 0
+    pad_value: 0.0
+
+  spec_augment:
+    _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+    freq_masks: 2
+    time_masks: 10
+    freq_width: 27
+    time_width: 0.05
+
+  encoder:
+    _target_: nemo.collections.asr.modules.transformer_encoder.TransformerEncoder
+    feat_in: ${model.preprocessor.features}
+    d_model: 1536
+    n_heads: 16
+    n_layers: 36
+    drop_rate: 0.1
+    dropout_pre_encoder: 0.1
+    dropout_emb: 0.0
+    qkv_bias: false
+    qk_norm: true
+    ff_expansion: 4
+    pre_block_norm: true
+    subsampling: feature_stacking
+    subsampling_factor: 8
+    self_attention_model: rel_pos
+    attn_mode: full
+    att_context_size: [[56, 3], [56, 0], [56, 6], [56, 13]]
+    att_context_probs: [0.25, 0.25, 0.25, 0.25]
+    att_context_style: chunked_limited
+
+  decoder:
+    _target_: nemo.collections.asr.modules.RNNTDecoder
+    normalization_mode: null
+    random_state_sampling: false
+    blank_as_pad: true
+    prednet:
+      pred_hidden: ${model.model_defaults.pred_hidden}
+      pred_rnn_layers: 2
+      t_max: null
+      dropout: 0.2
+
+  joint:
+    _target_: nemo.collections.asr.modules.RNNTJoint
+    log_softmax: null
+    preserve_memory: false
+    fuse_loss_wer: true
+    fused_batch_size: 2
+    jointnet:
+      joint_hidden: ${model.model_defaults.joint_hidden}
+      activation: relu
+      dropout: 0.2
+
+  decoding:
+    strategy: greedy_batch
+    model_type: rnnt
+    greedy:
+      max_symbols: 10
+      use_cuda_graph_decoder: false
+    beam:
+      beam_size: 2
+      return_best_hypothesis: false
+      score_norm: true
+      tsd_max_sym_exp: 50
+      alsd_max_target_len: 2.0
+
+  loss:
+    loss_name: default
+    warprnnt_numba_kwargs:
+      fastemit_lambda: 0.0
+      clamp: -1.0
+
+  optim:
+    name: adamw
+    lr: 5e-4
+    betas: [0.9, 0.95]
+    weight_decay: 1e-2
+    sched:
+      name: CosineAnnealing
+      warmup_steps: 10000
+      warmup_ratio: null
+      min_lr: 1e-6
+
+trainer:
+  devices: -1
+  num_nodes: 1
+  max_epochs: -1
+  # Sets the cosine decay horizon. Extending this re-stretches the cosine at the
+  # resumed step rather than appending to it: raising 300k -> 500k lifts the LR at
+  # step 290k from 2.2e-6 back to 1.6e-4, so expect a warm-restart loss spike.
+  max_steps: 500000
+  limit_train_batches: 10000
+  limit_val_batches: 1.0
+  val_check_interval: 2000
+  accelerator: auto
+  accumulate_grad_batches: 1
+  gradient_clip_val: 0.5
+  precision: bf16
+  log_every_n_steps: 100
+  enable_progress_bar: true
+  num_sanity_val_steps: 0
+  check_val_every_n_epoch: 1
+  sync_batchnorm: true
+  enable_checkpointing: false
+  logger: false
+  benchmark: false
+  use_distributed_sampler: false
+  strategy:
+    _target_: lightning.pytorch.strategies.DDPStrategy
+    gradient_as_bucket_view: true
+
+exp_manager:
+  exp_dir: null
+  explicit_log_dir: null
+  name: ${name}
+  create_tensorboard_logger: false
+  create_checkpoint_callback: true
+  use_datetime_version: false
+  resume_if_exists: true
+  resume_ignore_no_checkpoint: true
+  create_wandb_logger: true
+  wandb_logger_kwargs:
+    name: ${name}
+    project: cache-aware-transformer-40langs
+    resume: true
+  checkpoint_callback_params:
+    monitor: val_wer
+    mode: min
+    save_top_k: 5
+    save_best_model: false
+    # {val_wer} (the p0p1 dev set) must stay first: NeMoModelCheckpoint locates the monitored
+    # metric with a plain substring search, and "all_val_wer" also contains "val_wer".
+    # Hyphen separators are also required there, since it truncates the parsed value at the
+    # first character matching [A-z] and then backs off one position for the separator.
+    filename: "{val_wer:.4f}-{all_val_wer:.4f}-{epoch}-{step}"
+    every_n_train_steps: ${trainer.val_check_interval}
+    every_n_epochs: null
+    always_save_nemo: true
